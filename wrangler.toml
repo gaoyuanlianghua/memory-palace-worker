@@ -1,6 +1,7 @@
-name = "memory-palace-worker"
+name = "gyuanpalace"
 main = "worker.js"
 compatibility_date = "2025-01-01"
+account_id = "ad75e8e45b6eeea0b0d6f7c97aeb83be"
 
 [vars]
 CHAIN_NAME = "GyuanPalace"
