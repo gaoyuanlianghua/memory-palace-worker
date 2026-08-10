@@ -53,7 +53,7 @@ export default {
   }
 }
 
-const PROTOCOL = 'MemoryChain/1.0', VERSION = '4.10.0'
+const PROTOCOL = 'MemoryChain/1.0', VERSION = '4.10.1'
 let ENV = null
 
 // ============================================================
