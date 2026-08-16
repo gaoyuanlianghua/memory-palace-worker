@@ -2,24 +2,18 @@ import { useEffect, useState } from 'react';
 import { api } from '../api/client';
 
 interface SystemStats {
-  clones: number;
-  tasks: number;
-  memories: number;
-  nodes: number;
-  edges: number;
-  hitRate: number;
-  patterns: number;
+  total_wallets: number;
+  total_agents: number;
+  active_tasks: number;
+  system_pool: number;
 }
 
 export function Dashboard() {
   const [stats, setStats] = useState<SystemStats>({
-    clones: 0,
-    tasks: 0,
-    memories: 0,
-    nodes: 0,
-    edges: 0,
-    hitRate: 0,
-    patterns: 0,
+    total_wallets: 0,
+    total_agents: 0,
+    active_tasks: 0,
+    system_pool: 0,
   });
   const [status, setStatus] = useState<any>(null);
   const [loading, setLoading] = useState(true);
@@ -27,25 +21,18 @@ export function Dashboard() {
   useEffect(() => {
     const fetchStats = async () => {
       try {
-        const [statusData, clonesData, tasksData, memoryData, graphData, cacheData, patternsData] = await Promise.all([
+        const [statusData, poolData, systemData] = await Promise.all([
           api.getStatus(),
-          api.getClones(),
-          api.getTasks(),
-          api.getMemoryStats(),
-          api.getGraphData(),
           api.getCacheStats(),
-          api.getPatterns(),
+          api.getQualityStats(),
         ]);
 
         setStatus(statusData);
         setStats({
-          clones: clonesData.clones.length,
-          tasks: tasksData.count,
-          memories: memoryData.totalEntries,
-          nodes: graphData.stats.totalNodes,
-          edges: graphData.stats.totalEdges,
-          hitRate: cacheData.cache.stats.hitRate,
-          patterns: patternsData.patterns.patterns.length,
+          total_wallets: poolData?.pool?.total_wallets || systemData?.stats?.total_wallets || 0,
+          total_agents: poolData?.pool?.total_agents || systemData?.stats?.total_agents || 0,
+          active_tasks: poolData?.pool?.active_tasks || systemData?.stats?.active_tasks || 0,
+          system_pool: systemData?.stats?.system_pool || 0,
         });
       } catch (error) {
         console.error('Failed to fetch stats:', error);
@@ -64,8 +51,8 @@ export function Dashboard() {
       <div className="card animate-pulse">
         <div className="card-body">
           <div className="h-8 bg-gray-700 rounded w-1/4 mb-4"></div>
-          <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-4">
-            {[...Array(7)].map((_, i) => (
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            {[...Array(4)].map((_, i) => (
               <div key={i} className="h-24 bg-gray-700 rounded"></div>
             ))}
           </div>
@@ -89,14 +76,11 @@ export function Dashboard() {
         )}
       </div>
       <div className="card-body">
-        <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-4">
-          <StatCard label="活跃分身" value={stats.clones} icon="🤖" color="blue" />
-          <StatCard label="待执行任务" value={stats.tasks} icon="📋" color="purple" />
-          <StatCard label="记忆总数" value={stats.memories} icon="🧠" color="green" />
-          <StatCard label="图谱节点" value={stats.nodes} icon="🔵" color="cyan" />
-          <StatCard label="图谱连接" value={stats.edges} icon="🔗" color="pink" />
-          <StatCard label="缓存命中" value={`${stats.hitRate}%`} icon="⚡" color="yellow" />
-          <StatCard label="识别模式" value={stats.patterns} icon="🔍" color="orange" />
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+          <StatCard label="总钱包数" value={stats.total_wallets} icon="💰" color="blue" />
+          <StatCard label="总代理数" value={stats.total_agents} icon="🤖" color="purple" />
+          <StatCard label="活跃任务" value={stats.active_tasks} icon="📋" color="green" />
+          <StatCard label="系统池" value={`${stats.system_pool.toFixed(4)} MC`} icon="🏦" color="yellow" />
         </div>
       </div>
     </div>
@@ -107,17 +91,14 @@ interface StatCardProps {
   label: string;
   value: number | string;
   icon: string;
-  color: 'blue' | 'purple' | 'green' | 'cyan' | 'pink' | 'yellow' | 'orange';
+  color: 'blue' | 'purple' | 'green' | 'yellow';
 }
 
 const colorClasses = {
   blue: 'from-blue-500/20 to-blue-600/10 border-blue-500/30',
   purple: 'from-purple-500/20 to-purple-600/10 border-purple-500/30',
   green: 'from-green-500/20 to-green-600/10 border-green-500/30',
-  cyan: 'from-cyan-500/20 to-cyan-600/10 border-cyan-500/30',
-  pink: 'from-pink-500/20 to-pink-600/10 border-pink-500/30',
   yellow: 'from-yellow-500/20 to-yellow-600/10 border-yellow-500/30',
-  orange: 'from-orange-500/20 to-orange-600/10 border-orange-500/30',
 };
 
 function StatCard({ label, value, icon, color }: StatCardProps) {

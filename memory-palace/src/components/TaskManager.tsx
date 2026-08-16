@@ -11,7 +11,7 @@ export function TaskManager() {
     const fetchTasks = async () => {
       try {
         const data = await api.getTasks();
-        setTasks(data.tasks);
+        setTasks(data.tasks || []);
       } catch (error) {
         console.error('Failed to fetch tasks:', error);
       } finally {
@@ -38,21 +38,15 @@ export function TaskManager() {
     }
   };
 
-  const typeLabels: Record<string, { label: string; icon: string; color: string }> = {
-    frontend: { label: '前端', icon: '🎨', color: 'blue' },
-    visualization: { label: '可视化', icon: '📊', color: 'purple' },
-    security: { label: '安全', icon: '🔒', color: 'red' },
-    backend: { label: '后端', icon: '⚙️', color: 'green' },
-  };
-
   const statusLabels: Record<string, { label: string; class: string }> = {
-    assigned: { label: '已分配', class: 'badge-info' },
+    active: { label: '活跃', class: 'badge-info' },
     in_progress: { label: '执行中', class: 'badge-warning' },
     completed: { label: '已完成', class: 'badge-success' },
     failed: { label: '失败', class: 'badge-error' },
   };
 
-  const formatDate = (timestamp: number) => {
+  const formatDate = (timestamp: number | undefined) => {
+    if (!timestamp) return '-';
     return new Date(timestamp).toLocaleString('zh-CN');
   };
 
@@ -68,59 +62,51 @@ export function TaskManager() {
       <div className="card-body">
         {loading ? (
           <div className="space-y-3">
-            {[...Array(4)].map((_, i) => (
-              <div key={i} className="h-24 bg-gray-700 rounded-lg animate-pulse"></div>
+            {[...Array(3)].map((_, i) => (
+              <div key={i} className="h-20 bg-gray-700 rounded-lg animate-pulse"></div>
             ))}
           </div>
         ) : (
           <div className="space-y-3 max-h-96 overflow-y-auto">
-            {tasks.map((task) => {
-              const typeInfo = typeLabels[task.type] || { label: task.type, icon: '📌', color: 'gray' };
-              const statusInfo = statusLabels[task.status] || { label: task.status, class: 'badge-info' };
+            {tasks.length === 0 ? (
+              <div className="text-center text-gray-500 py-8">
+                <p>暂无活跃任务</p>
+              </div>
+            ) : (
+              tasks.map((task) => {
+                const statusInfo = statusLabels[task.status] || { label: task.status, class: 'badge-info' };
 
-              return (
-                <div
-                  key={task.id}
-                  className="p-4 bg-gray-700/50 rounded-lg hover:bg-gray-700 transition-colors"
-                >
-                  <div className="flex items-start justify-between mb-3">
-                    <div className="flex items-center gap-3">
-                      <span className="text-2xl">{typeInfo.icon}</span>
+                return (
+                  <div
+                    key={task.id}
+                    className="p-4 bg-gray-700/50 rounded-lg hover:bg-gray-700 transition-colors"
+                  >
+                    <div className="flex items-start justify-between mb-3">
                       <div>
-                        <h3 className="font-semibold text-white">{task.description}</h3>
+                        <h3 className="font-semibold text-white">{task.title}</h3>
                         <p className="text-xs text-gray-400 mt-1">
-                          ID: {task.id.slice(-12)} | 创建: {formatDate(task.createdAt)}
+                          ID: {task.id.slice(-12)} | 奖励: {task.reward} MC
                         </p>
                       </div>
+                      <span className={statusInfo.class}>{statusInfo.label}</span>
                     </div>
-                    <span className={statusInfo.class}>{statusInfo.label}</span>
-                  </div>
 
-                  {task.requirements.length > 0 && (
-                    <div className="flex flex-wrap gap-2 mb-3">
-                      {task.requirements.map((req, idx) => (
-                        <span key={idx} className="badge bg-gray-600 text-gray-200">
-                          {req}
-                        </span>
-                      ))}
+                    <div className="flex items-center justify-between">
+                      <p className="text-sm text-gray-400">
+                        创建: {formatDate(task.createdAt)}
+                      </p>
+                      <button
+                        onClick={() => handleExecute(task.id)}
+                        disabled={executing === task.id || task.status !== 'active'}
+                        className="btn-primary text-sm"
+                      >
+                        {executing === task.id ? '执行中...' : '执行'}
+                      </button>
                     </div>
-                  )}
-
-                  <div className="flex items-center justify-between">
-                    <p className="text-sm text-gray-400">
-                      分配至: <span className="text-blue-400">{task.assignedClone}</span>
-                    </p>
-                    <button
-                      onClick={() => handleExecute(task.id)}
-                      disabled={executing === task.id || task.status !== 'assigned'}
-                      className="btn-primary text-sm"
-                    >
-                      {executing === task.id ? '执行中...' : '执行'}
-                    </button>
                   </div>
-                </div>
-              );
-            })}
+                );
+              })
+            )}
           </div>
         )}
       </div>

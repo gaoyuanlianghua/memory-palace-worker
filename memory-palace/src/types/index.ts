@@ -1,10 +1,10 @@
 export interface SystemStatus {
   system: string;
-  concept: string;
-  version: string;
-  mode: string;
-  timestamp: string;
-  date: string;
+  concept?: string;
+  version?: string;
+  mode?: string;
+  timestamp?: string;
+  date?: string;
 }
 
 export interface Clone {
@@ -16,12 +16,20 @@ export interface Clone {
 
 export interface Task {
   id: string;
-  type: string;
-  description: string;
-  requirements: string[];
-  assignedClone: string;
-  status: 'assigned' | 'in_progress' | 'completed' | 'failed';
-  createdAt: number;
+  title?: string;
+  description?: string;
+  type?: string;
+  requirements?: string[];
+  assignedClone?: string;
+  status: 'active' | 'assigned' | 'in_progress' | 'completed' | 'failed';
+  createdAt?: number;
+  reward?: number;
+  room?: string;
+  required_level?: number;
+  claimed_by?: string;
+  completed_by?: string;
+  result?: string;
+  deadline?: number;
 }
 
 export interface MemoryStats {
@@ -92,11 +100,16 @@ export interface SharedPool {
 }
 
 export interface LogEntry {
-  chain_id: string;
-  wallet: string;
-  chain_length: number;
-  level: number;
-  created_at: string;
+  chain_id?: string;
+  wallet?: string;
+  chain_length?: number;
+  level?: number;
+  created_at?: string;
+  agent_id?: string;
+  action?: string;
+  target?: string;
+  result?: string;
+  reason?: string;
 }
 
 export interface ApiResponse<T> {
