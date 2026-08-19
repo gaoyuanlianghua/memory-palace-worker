@@ -1,5 +1,5 @@
-name = "gyuanpalace"
-main = "worker.js"
+﻿name = "gyuanpalace"
+main = "gyuanpalace-worker.js"
 compatibility_date = "2025-01-01"
 account_id = "ad75e8e45b6eeea0b0d6f7c97aeb83be"
 
@@ -8,9 +8,17 @@ CHAIN_NAME = "GyuanPalace"
 PROTOCOL = "MemoryChain/1.0"
 
 [triggers]
-crons = ["* * * * *"]
+crons = ["*/10 * * * *"]
 
 [[d1_databases]]
 binding = "gyuanpalace_db"
 database_name = "gyuanpalace-db"
 database_id = "6cfddbd9-eaf5-4220-bfe7-4005e53aa677"
+
+# Custom domain route (DNS must point to Cloudflare first)
+[[routes]]
+pattern = "gyuanpalace.xyz/*"
+zone_name = "gyuanpalace.xyz"
+
+# Secrets (set via wrangler secret put)
+# CLOUDFLARE_API_TOKEN
