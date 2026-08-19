@@ -233,6 +233,8 @@ async function handleGet(path, url) {
     '/api/audit/list': () => auditList(url),
     '/api/command/list': () => commandList(url),
     '/api/memory/list': () => memoryChainList(url),
+    '/api/memory/export': () => memoryChainExport(url),
+    '/api/memory/export/all': () => memoryChainExportAll(url),
     '/api/worker/codes': () => workerCodeList(url),
     '/api/worker/code': () => workerCodeGet(url),
     '/api/memory/verify': async () => {
@@ -1027,6 +1029,33 @@ async function memoryChainList(url) {
   return json({ chains: await dbGet(sql, params) })
 }
 
+async function memoryChainExport(url) {
+  const agent_id = url.searchParams.get('agent_id') || 'OpenClaw_AI'
+  const wallet = url.searchParams.get('wallet')
+  const chain = await dbFirst('SELECT * FROM memory_chains WHERE agent_id = ?', [agent_id])
+  if (!chain) return json({ error: 'Chain not found', agent_id })
+  if (wallet && chain.wallet !== wallet) return json({ error: 'Wallet mismatch' }, 403)
+  let data = []
+  try { data = JSON.parse(chain.chain_data) } catch(e) {}
+  return json({
+    exported: true,
+    chain_id: chain.chain_id,
+    agent_id: chain.agent_id,
+    wallet: chain.wallet,
+    chain_length: chain.chain_length,
+    level: chain.level,
+    checksum: chain.checksum,
+    created: chain.created,
+    updated: chain.updated,
+    data
+  })
+}
+
+async function memoryChainExportAll(url) {
+  const chains = await dbGet('SELECT chain_id, agent_id, wallet, chain_length, level, checksum, created, updated FROM memory_chains ORDER BY updated DESC')
+  return json({ exported: true, count: chains.length, chains })
+}
+
 // ============================================================
 // ?? ????
 // ============================================================
@@ -1500,7 +1529,7 @@ async function completePowTask(body) {
   if (!task) return json({ error: 'Task not found' }, 404)
   if (task.claimed_by !== agent_id) return json({ error: 'Not claimed by this agent' }, 403)
   const testHash = await hmacSign(nonce + challenge_hash, 'pow')
-  const difficulty = task.description?.match(/difficulty[:\s]*(\d+)/i)?.[1] || 2
+  const difficulty = task.description?.match(/D=(\d+)/i)?.[1] || task.description?.match(/difficulty[:\s]*(\d+)/i)?.[1] || 2
   const prefix = '0'.repeat(parseInt(difficulty))
   if (!testHash.startsWith(prefix)) return json({ error: 'Invalid PoW', hash: testHash, expected_prefix: prefix }, 400)
   const node = await dbFirst('SELECT * FROM wallet_nodes WHERE wallet = ?', [wallet])
