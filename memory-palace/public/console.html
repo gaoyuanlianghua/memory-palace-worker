@@ -1048,8 +1048,8 @@ async function doDevCall() {
 function openRegister() {
   openModal('注册钱包','注册后自动保存到本机浏览器',
     '<div class="field"><label>钱包地址（留空自动生成）</label><input id="regWallet" placeholder="留空自动生成"></div>'+
-    '<div class="field"><label>密码（至少 12 位，用于找回）</label><input id="regPass" type="password" placeholder="设置密码"></div>'+
-    '<div class="field"><label>邮箱（可选）</label><input id="regEmail" placeholder="用于找回 API Key"></div>',
+    '<div class="field"><label>登录密码（≥12 位，用于密码登录）</label><input id="regPass" type="password" placeholder="设置密码"></div>'+
+    '<div class="field"><label>邮箱（可选，找回提示）</label><input id="regEmail" placeholder="用于找回 API Key"></div>',
     '<button class="btn btn-ghost" onclick="closeModal()">取消</button><button class="btn" onclick="doRegister()">注册</button>');
 }
 async function doRegister() {
@@ -1062,7 +1062,7 @@ async function doRegister() {
       store.wallet = wallet; store.apiKey = d.api_key || store.apiKey;
       localStorage.setItem(LS.wallet, wallet);
       if (d.api_key) localStorage.setItem(LS.key, d.api_key);
-      toast('注册成功，钱包已保存','ok');
+      toast(password && d.has_password ? '注册成功，密码已保存' : (d.api_key ? '注册成功，已保存 API Key' : '注册成功，钱包已保存'),'ok');
       closeModal(); refreshWalletLine(); refresh();
     } else { toast(d.error || d.message || '注册失败','err'); }
   } catch(e){ toast(e.message,'err'); }
@@ -1073,34 +1073,165 @@ function generateWallet() {
   for (let i=0;i<16;i++) s += chars[Math.floor(Math.random()*chars.length)];
   return s;
 }
+/* HMAC-SHA256（十六进制）：与 Worker 端 hmacSign 一致，用于钱包签名找回 */
+async function hmacHex(message, key) {
+  const enc = new TextEncoder();
+  const ck = await crypto.subtle.importKey('raw', enc.encode(key), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', ck, enc.encode(message));
+  return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+function copyToClipboard(txt) {
+  if (navigator.clipboard && navigator.clipboard.writeText) return navigator.clipboard.writeText(txt);
+  const ta = document.createElement('textarea'); ta.value = txt; document.body.appendChild(ta); ta.select();
+  try { document.execCommand('copy'); } catch(e) {} document.body.removeChild(ta); return Promise.resolve();
+}
+
 function openLogin() {
-  openModal('跨设备登录','输入钱包地址与 API Key，本设备将接入记忆宫殿（每台设备独立会话）',
-    '<div class="field"><label>钱包地址</label><input id="lgWallet" placeholder="WALLET_xxx" value="'+esc(store.wallet)+'"></div>'+
-    '<div class="field"><label>API Key</label><input id="lgKey" placeholder="粘贴 API Key"></div>'+
-    '<div class="sub" style="margin-top:6px">🔐 登录后本设备获得独立会话令牌（30 天有效），可在设置中管理已登录设备</div>',
+  openModal('账号登录','钱包 + 密码 / API Key 双通道登录，本设备接入记忆宫殿',
+    '<div style="display:flex;gap:8px;margin-bottom:10px">'+
+    '<button id="tabPwd" class="btn" style="flex:1" onclick="switchLoginTab(0)">密码登录</button>'+
+    '<button id="tabKey" class="btn btn-ghost" style="flex:1" onclick="switchLoginTab(1)">API Key 登录</button></div>'+
+    '<div id="pwdPane"><div class="field"><label>钱包地址</label><input id="lgWallet" placeholder="WALLET_xxx" value="'+esc(store.wallet)+'"></div>'+
+    '<div class="field"><label>密码</label><input id="lgPass" type="password" placeholder="登录密码"></div></div>'+
+    '<div id="keyPane" style="display:none"><div class="field"><label>钱包地址</label><input id="lgWallet2" placeholder="WALLET_xxx" value="'+esc(store.wallet)+'"></div>'+
+    '<div class="field"><label>API Key</label><input id="lgKey" placeholder="粘贴 API Key"></div></div>'+
+    '<div class="sub" style="margin-top:6px">登录后本设备获得独立会话（30 天有效）。忘记密码或丢失 Key？<a href="javascript:openRecover()">点此找回</a></div>',
     '<button class="btn btn-ghost" onclick="closeModal()">取消</button><button class="btn" onclick="doLogin()">登录</button>');
+  switchLoginTab(0);
+}
+let loginTab = 0;
+function switchLoginTab(i) {
+  loginTab = i;
+  $('tabPwd').className = i===0 ? 'btn' : 'btn btn-ghost';
+  $('tabKey').className = i===1 ? 'btn' : 'btn btn-ghost';
+  $('pwdPane').style.display = i===0 ? '' : 'none';
+  $('keyPane').style.display = i===1 ? '' : 'none';
 }
 async function doLogin() {
-  const wallet = q('lgWallet').trim(), key = q('lgKey').trim();
-  if (!wallet || !key) return toast('请填写钱包和 API Key','err');
-  try {
-    const d = await api('POST','/api/device/login',{wallet, api_key: key, device_id: deviceId(), device_name: deviceName()});
-    if (d.logged_in && d.session_token) {
+  if (loginTab === 0) {
+    // 密码通道：POST /api/account/login
+    const wallet = q('lgWallet').trim(), password = q('lgPass').value;
+    if (!wallet || !password) return toast('请填写钱包和密码','err');
+    try {
+      const d = await api('POST','/api/account/login',{wallet, password, device_id: deviceId(), device_name: deviceName()});
+      if (!d.logged_in || !d.session_token) { toast(d.error || '登录未完成','err'); return; }
+      store.wallet = wallet; store.sessionToken = d.session_token;
+      localStorage.setItem(LS.wallet, wallet); localStorage.setItem(LS.token, d.session_token);
+      toast('已登录 '+maskWallet(wallet)+'（密码通道）','ok');
+    } catch(e) {
+      if (/Not found|404|找不到/.test(e.message||'')) { toast('当前节点未部署账号通道，请改用 API Key 登录','err'); return; }
+      toast('登录失败：'+e.message,'err'); return;
+    }
+  } else {
+    // API Key 通道：POST /api/device/login
+    const wallet = q('lgWallet2').trim(), key = q('lgKey').trim();
+    if (!wallet || !key) return toast('请填写钱包和 API Key','err');
+    try {
+      const d = await api('POST','/api/device/login',{wallet, api_key: key, device_id: deviceId(), device_name: deviceName()});
+      if (!d.logged_in || !d.session_token) { toast(d.error || '登录未完成','err'); return; }
       store.wallet = wallet; store.apiKey = key; store.sessionToken = d.session_token;
       localStorage.setItem(LS.wallet, wallet); localStorage.setItem(LS.key, key); localStorage.setItem(LS.token, d.session_token);
       toast('已登录 '+maskWallet(wallet)+'，跨设备会话已接入','ok');
-    } else {
-      toast(d.error || '登录未完成','err'); return;
+    } catch(e) {
+      // 兼容旧版 Worker（未部署设备接口）：降级为本地绑定
+      if (/Not found|404|找不到/.test(e.message||'')) {
+        store.wallet = wallet; store.apiKey = key;
+        localStorage.setItem(LS.wallet, wallet); localStorage.setItem(LS.key, key);
+        toast('已绑定 '+maskWallet(wallet)+'（旧版节点，无设备会话）','ok');
+      } else { toast('登录失败：'+e.message,'err'); return; }
     }
-  } catch(e) {
-    // 兼容旧版 Worker（未部署设备接口）：降级为本地绑定
-    if (/Not found|404|找不到/.test(e.message||'')) {
-      store.wallet = wallet; store.apiKey = key;
-      localStorage.setItem(LS.wallet, wallet); localStorage.setItem(LS.key, key);
-      toast('已绑定 '+maskWallet(wallet)+'（旧版节点，无设备会话）','ok');
-    } else { toast('登录失败：'+e.message,'err'); return; }
   }
   closeModal(); refreshWalletLine(); refresh();
+}
+
+/* ---------- 找回凭证（钱包签名验证） ---------- */
+let recoverChallenge = null;
+function openRecover() {
+  recoverChallenge = null; window.__rcSig = ''; window.__rcWallet = '';
+  openModal('找回凭证','通过钱包签名验证身份后，可重置密码或取回 API Key',
+    '<div class="field"><label>钱包地址</label><input id="rcWallet" placeholder="WALLET_xxx" value="'+esc(store.wallet)+'"></div>'+
+    '<div class="sub" style="margin-top:6px">系统将生成挑战码，你用钱包对挑战码签名（HMAC-SHA256）以证明身份，签名一次性有效</div>',
+    '<button class="btn btn-ghost" onclick="closeModal()">取消</button><button class="btn" onclick="recoverNext()">获取挑战码并签名</button>');
+}
+async function recoverNext() {
+  const wallet = q('rcWallet').trim();
+  if (!wallet) return toast('请填写钱包地址','err');
+  window.__rcWallet = wallet;
+  try {
+    const c = await api('POST','/api/wallet/challenge',{wallet});
+    if (!c.challenge) { toast(c.error || '获取挑战码失败（钱包可能未注册）','err'); return; }
+    recoverChallenge = c.challenge;
+    window.__rcSig = await hmacHex(c.challenge, wallet);
+    openModal('找回凭证','钱包签名验证成功（一次性），选择找回项目',
+      '<div class="sub">钱包 '+esc(maskWallet(wallet))+'</div>'+
+      '<div style="display:flex;gap:8px;margin-top:12px">'+
+      '<button class="btn" style="flex:1" onclick="recoverKey()">找回 API Key</button>'+
+      '<button class="btn btn-ghost" style="flex:1" onclick="openResetPwd()">重置密码</button></div>',
+      '<button class="btn btn-ghost" onclick="closeModal()">取消</button>');
+  } catch(e) { toast(e.message,'err'); }
+}
+async function recoverKey() {
+  if (!window.__rcSig || !recoverChallenge) return toast('请重新发起找回流程','err');
+  try {
+    const d = await api('POST','/api/account/key/recover',{wallet: window.__rcWallet, challenge: recoverChallenge, signature: window.__rcSig});
+    if (!d.recovered) { toast(d.error || '找回失败','err'); return; }
+    window.__rcKey = d.api_key;
+    openModal('找回成功','请立即保存你的 API Key','<div class="field"><label>API Key</label><input value="'+esc(d.api_key)+'" readonly style="user-select:all"></div>'+
+      '<div class="sub" style="margin-top:6px">找回操作已完成，挑战码已失效</div>',
+      '<button class="btn" onclick="copyRecovered()">复制并关闭</button>');
+  } catch(e) { toast(e.message,'err'); }
+}
+function copyRecovered() {
+  if (window.__rcKey) copyToClipboard(window.__rcKey);
+  toast('已复制到剪贴板','ok'); closeModal(); refresh();
+}
+function openResetPwd() {
+  openModal('重置密码','钱包签名已验证，设置新密码（≥12 位）',
+    '<div class="field"><label>新密码</label><input id="rsPwd" type="password" placeholder="至少 12 位"></div>'+
+    '<div class="field"><label>确认密码</label><input id="rsPwd2" type="password" placeholder="再次输入"></div>',
+    '<button class="btn btn-ghost" onclick="closeModal()">取消</button><button class="btn" onclick="doResetPwd()">确认重置</button>');
+}
+async function doResetPwd() {
+  if (!window.__rcSig || !recoverChallenge) return toast('请重新发起找回流程','err');
+  const p1 = q('rsPwd').value, p2 = q('rsPwd2').value;
+  if (p1.length < 12) return toast('密码至少 12 位','err');
+  if (p1 !== p2) return toast('两次密码不一致','err');
+  try {
+    const d = await api('POST','/api/account/password/reset',{wallet: window.__rcWallet, challenge: recoverChallenge, signature: window.__rcSig, new_password: p1});
+    if (!d.reset) { toast(d.error || '重置失败','err'); return; }
+    toast('密码已重置，请用新密码登录','ok'); closeModal();
+  } catch(e) { toast(e.message,'err'); }
+}
+/* 修改密码（已登录，需 api_key 或 session_token 鉴权） */
+function openSetPwd() {
+  openModal('设置/修改密码','用于密码通道登录（≥12 位）',
+    '<div class="field"><label>新密码</label><input id="spPwd" type="password" placeholder="至少 12 位"></div>'+
+    '<div class="field"><label>确认密码</label><input id="spPwd2" type="password" placeholder="再次输入"></div>',
+    '<button class="btn btn-ghost" onclick="closeModal()">取消</button><button class="btn" onclick="doSetPwd()">保存</button>');
+}
+async function doSetPwd() {
+  const p1 = q('spPwd').value, p2 = q('spPwd2').value;
+  if (p1.length < 12) return toast('密码至少 12 位','err');
+  if (p1 !== p2) return toast('两次密码不一致','err');
+  try {
+    const d = await api('POST','/api/account/password/set',{wallet: store.wallet, password: p1});
+    if (!d.updated) { toast(d.error || '保存失败','err'); return; }
+    toast('密码已保存','ok'); closeModal(); renderAccountPanel();
+  } catch(e) { toast(e.message,'err'); }
+}
+function openBindEmail() {
+  openModal('绑定邮箱','用于找回提示（不会发送验证邮件）',
+    '<div class="field"><label>邮箱</label><input id="beEmail" placeholder="you@example.com"></div>',
+    '<button class="btn btn-ghost" onclick="closeModal()">取消</button><button class="btn" onclick="doBindEmail()">绑定</button>');
+}
+async function doBindEmail() {
+  const email = q('beEmail').trim();
+  if (!email) return toast('请填写邮箱','err');
+  try {
+    const d = await api('POST','/api/account/email/bind',{wallet: store.wallet, email});
+    if (!d.bound) { toast(d.error || '绑定失败','err'); return; }
+    toast('邮箱已绑定','ok'); closeModal(); renderAccountPanel();
+  } catch(e) { toast(e.message,'err'); }
 }
 
 /* ---------- 设置 ---------- */
@@ -1115,7 +1246,12 @@ function openSettings() {
     '<div class="card" style="padding:12px"><h2>👤 账户</h2><div class="kv"><span class="k">钱包</span><span class="v">'+esc(maskWallet(store.wallet))+'</span></div>'+
     '<div class="kv"><span class="k">API Key</span><span class="v">'+esc(store.apiKey?store.apiKey.slice(0,8)+'…'+store.apiKey.slice(-4):'未设置')+'</span></div>'+
     '<div class="kv"><span class="k">会话</span><span class="v">'+(store.sessionToken?'跨设备会话已接入':'未接入设备会话')+'</span></div>'+
-    '<div class="toolbar" style="margin-top:8px"><button class="btn btn-danger btn-sm" onclick="logout()">退出登录</button></div></div>'+
+    '<div id="acctPanel">'+spinner('加载账号信息…')+'</div>'+
+    '<div class="toolbar" style="margin-top:8px;gap:8px;flex-wrap:wrap">'+
+    '<button class="btn btn-sm" onclick="openSetPwd()">设置/修改密码</button>'+
+    '<button class="btn btn-sm" onclick="openBindEmail()">绑定邮箱</button>'+
+    '<button class="btn btn-sm" onclick="openRecover()">找回凭证</button>'+
+    '<button class="btn btn-danger btn-sm" onclick="logout()">退出登录</button></div></div>'+
     '<div class="card" style="padding:12px"><h2>📱 已登录设备</h2><div class="sub">每台设备独立会话，可远程下线</div><div id="devPanel">'+spinner('加载设备列表…')+'</div></div>'+
     '<div class="card" style="padding:12px"><h2>🤖 LLM 算力（钱包分身）</h2><div class="sub">用大模型 API Key 作为分身算力：后台自动完成任务挖矿/记忆挖矿/记忆优化，每日限额控制成本</div>'+
     '<div id="llmPanel">'+spinner('加载 LLM 算力状态…')+'</div></div>'+
@@ -1132,6 +1268,24 @@ function openSettings() {
     '<button class="btn" onclick="closeModal()">完成</button>');
   setTimeout(renderLlmPanel, 60);
   setTimeout(renderDevPanel, 60);
+  setTimeout(renderAccountPanel, 60);
+}
+
+/* ---------- 账号管理器：密码/邮箱/Key 状态概览 ---------- */
+async function renderAccountPanel() {
+  const box = $('acctPanel');
+  if (!box) return;
+  if (!store.wallet) { box.innerHTML = '<div class="sub" style="margin-top:8px">未登录</div>'; return; }
+  try {
+    const d = await api('GET','/api/account/info?wallet='+encodeURIComponent(store.wallet));
+    box.innerHTML =
+      '<div class="kv" style="margin-top:8px"><span class="k">登录密码</span><span class="v">'+(d.has_password?'已设置 <span class="badge b-ok">'+(d.password_set_at?fmtTime(d.password_set_at):'')+'</span>':'<span class="badge">未设置</span>')+'</span></div>'+
+      '<div class="kv"><span class="k">邮箱</span><span class="v">'+esc(d.email_bound?d.email:'未绑定')+'</span></div>'+
+      '<div class="kv"><span class="k">API Key</span><span class="v">'+esc(d.api_key_masked||'—')+'</span></div>'+
+      '<div class="kv"><span class="k">已登录设备</span><span class="v">'+d.device_count+' 台</span></div>';
+  } catch(e) {
+    box.innerHTML = '<div class="err-box" style="margin-top:8px">⚠️ '+esc(e.message)+'</div>';
+  }
 }
 
 /* ---------- 跨设备登录：已登录设备管理 ---------- */

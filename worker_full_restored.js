@@ -475,6 +475,8 @@ const apiDocs = async () => {
         'POST /api/wallet/challenge {wallet} → 获取 challenge',
         '用钱包私钥签名 challenge → 得到 signature',
         'POST /api/wallet/verify {session_id, wallet, signature} → 获取 session_token',
+        '账号密码通道：注册时设置密码 → POST /api/account/login {wallet, password} → 获取 session_token',
+        '找回：忘记密码/丢失 Key → wallet/challenge 签名验证 → account/password/reset 或 account/key/recover',
         '跨设备：POST /api/device/login {wallet, api_key, device_id, device_name} → 该设备专属 session_token（30 天）',
         '后续请求携带 ?session_token=xxx 或 X-API-Key 头'
       ]
@@ -494,6 +496,12 @@ const apiDocs = async () => {
         { method: 'GET', path: '/api/device/sessions', params: { wallet: 'string' }, desc: '设备列表：本钱包所有已登录设备', auth: 'wallet' },
         { method: 'POST', path: '/api/device/logout', params: { session_token: 'string' }, desc: '登出当前设备会话', auth: false },
         { method: 'POST', path: '/api/device/revoke', params: { wallet: 'string', device_id: 'string' }, desc: '强制下线指定设备', auth: 'wallet' },
+        { method: 'POST', path: '/api/account/login', params: { wallet: 'string', password: 'string', device_id: 'string(可选)', device_name: 'string(可选)' }, desc: '账号密码登录：校验密码并签发设备会话', auth: false },
+        { method: 'POST', path: '/api/account/password/set', params: { wallet: 'string', password: 'string(≥12位)' }, desc: '设置/修改登录密码', auth: 'wallet' },
+        { method: 'POST', path: '/api/account/password/reset', params: { wallet: 'string', challenge: 'string', signature: 'string', new_password: 'string' }, desc: '钱包签名找回：重置密码', auth: false },
+        { method: 'POST', path: '/api/account/key/recover', params: { wallet: 'string', challenge: 'string', signature: 'string' }, desc: '钱包签名找回：取回完整 API Key', auth: false },
+        { method: 'GET', path: '/api/account/info', params: { wallet: 'string' }, desc: '账号概览：密码/邮箱/设备/Key 掩码状态', auth: 'wallet' },
+        { method: 'POST', path: '/api/account/email/bind', params: { wallet: 'string', email: 'string' }, desc: '绑定找回邮箱（提示用途）', auth: 'wallet' },
         { method: 'GET', path: '/api/wallet/info', params: {}, desc: '钱包列表（已加密掩码）', auth: false },
         { method: 'GET', path: '/api/wallet/status', params: { wallet: 'string' }, desc: '钱包状态（余额、注册时间）', auth: false },
         { method: 'GET', path: '/api/wallet/profile', params: { wallet: 'string' }, desc: '钱包详细资料', auth: 'wallet' },
@@ -1601,6 +1609,12 @@ async function ensureTables() {
       dbRun(`ALTER TABLE auth_sessions ADD COLUMN device_id TEXT`).catch(() => {}),
       dbRun(`ALTER TABLE auth_sessions ADD COLUMN device_name TEXT`).catch(() => {}),
       dbRun(`ALTER TABLE auth_sessions ADD COLUMN ip_hash TEXT`).catch(() => {}),
+      // 账号登录管理器：密码（加盐哈希）、邮箱（幂等补列，兼容已注册钱包）
+      dbRun(`ALTER TABLE wallet_credentials ADD COLUMN password_hash TEXT`).catch(() => {}),
+      dbRun(`ALTER TABLE wallet_credentials ADD COLUMN password_salt TEXT`).catch(() => {}),
+      dbRun(`ALTER TABLE wallet_credentials ADD COLUMN password_set_at INTEGER DEFAULT 0`).catch(() => {}),
+      dbRun(`ALTER TABLE wallet_credentials ADD COLUMN email TEXT`).catch(() => {}),
+      dbRun(`ALTER TABLE wallet_credentials ADD COLUMN email_verified INTEGER DEFAULT 0`).catch(() => {}),
       dbRun(`CREATE TABLE IF NOT EXISTS audit_log (id TEXT PRIMARY KEY, wallet TEXT, agent_id TEXT, action TEXT, target TEXT, result TEXT, reason TEXT, ip_hash TEXT, created INTEGER)`),
       dbRun(`CREATE TABLE IF NOT EXISTS events (event_id TEXT PRIMARY KEY, event_type TEXT, actor TEXT, data TEXT DEFAULT '{}', created INTEGER)`),
       dbRun(`CREATE TABLE IF NOT EXISTS memory_chains (chain_id TEXT PRIMARY KEY, agent_id TEXT, wallet TEXT, chain_data TEXT, chain_length INTEGER, compressed_bytes INTEGER, original_bytes INTEGER, level INTEGER DEFAULT 1, checksum TEXT, backup_path TEXT, created INTEGER, updated INTEGER)`),
@@ -2615,6 +2629,11 @@ async function handlePost(path, body, url) {
     '/api/device/login': () => deviceLogin(body, url),
     '/api/device/logout': () => deviceLogout(body),
     '/api/device/revoke': () => deviceRevoke(body, url),
+    '/api/account/login': () => accountLogin(body),
+    '/api/account/password/set': () => accountPasswordSet(body, url),
+    '/api/account/password/reset': () => accountPasswordReset(body),
+    '/api/account/key/recover': () => accountKeyRecover(body),
+    '/api/account/email/bind': () => accountEmailBind(body, url),
     '/api/wallet/withdraw': () => walletWithdraw(body),
     '/api/wallet/deposit': () => walletDeposit(body),
     '/api/palace/command': () => palaceCommand(body),
@@ -2835,6 +2854,7 @@ async function handleGet(path, url) {
     '/api/wallet/profile': () => walletProfile(url),
     '/api/wallet/memory_stats': () => walletMemoryStats(url),
     '/api/device/sessions': () => deviceSessionsList(url),
+    '/api/account/info': () => accountInfo(url),
     '/api/memory/export': () => memoryChainExport(url),
     '/api/memory/export/all': () => memoryChainExportAll(url),
     '/api/broadcast/schedule': () => broadcastScheduleList(url.searchParams.get('wallet')),
@@ -3095,7 +3115,7 @@ async function generateApiKey(wallet) {
 }
 
 async function walletRegister(body) {
-  const { wallet, public_key } = body
+  const { wallet, public_key, password, email } = body
   if (!wallet) return json({ error: 'Wallet required' }, 400)
   const existing = await dbFirst('SELECT wallet FROM wallets WHERE wallet = ?', [wallet])
   if (existing) return json({ error: 'Wallet already registered' }, 409)
@@ -3104,13 +3124,17 @@ async function walletRegister(body) {
   const apiKey = await generateApiKey(wallet)
   const nodeId = 'NODE_' + randStr(6)
   const now = Date.now()
+  // 账号登录管理器：注册时可选设置密码（加盐哈希）与邮箱，作为 API Key 之外的登录/找回通道
+  const passwordHash = password ? await hashPassword(password) : null
+  const passwordSalt = password ? passwordHash.salt : null
+  const emailTrim = (email || '').trim().slice(0, 120) || null
   // 原子事务：三表同时写入，任一失败则全部回滚
   await dbBatch([
     ['INSERT INTO wallets (wallet, balance, registered_at) VALUES (?, ?, ?)', [wallet, 1.0, now]],
-    ['INSERT INTO wallet_credentials (wallet, public_key, credential_hash, salt, created) VALUES (?, ?, ?, ?, ?)', [wallet, public_key || null, credentialHash, salt, now]],
+    ['INSERT INTO wallet_credentials (wallet, public_key, credential_hash, salt, password_hash, password_salt, password_set_at, email, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [wallet, public_key || null, credentialHash, salt, passwordHash ? passwordHash.hash : null, passwordSalt, passwordHash ? now : 0, emailTrim, now]],
     ['INSERT INTO wallet_api_keys (wallet, api_key, created, status) VALUES (?, ?, ?, ?)', [wallet, apiKey, now, 'active']]
   ])
-  return json({ registered: true, wallet: maskWallet(wallet), balance: 1.0, api_key: apiKey, node_id: nodeId, initial_balance: 1.0, message: '钱包已注册，凭证已加密存储', network_time: Date.now() })
+  return json({ registered: true, wallet: maskWallet(wallet), balance: 1.0, api_key: apiKey, node_id: nodeId, initial_balance: 1.0, has_password: !!password, message: password ? '钱包已注册，密码与凭证已加密存储' : '钱包已注册，凭证已加密存储', network_time: Date.now() })
 }
 
 async function walletChallenge(body) {
@@ -3205,6 +3229,135 @@ async function deviceRevoke(body, url) {
   if (!target) return json({ error: 'device not found or already logged out' }, 404)
   await dbRun('UPDATE auth_sessions SET status = ? WHERE session_id = ?', ['revoked', target.session_id])
   return json({ revoked: true, device_id, device_name: target.device_name || '未命名设备', network_time: Date.now() })
+}
+
+// ============================================================
+// 🔐 账号登录注册管理器（密码 + API Key 双通道 / 钱包签名找回）
+// ============================================================
+
+// 密码哈希：HMAC-SHA256 + 随机盐（与系统钱包签名模型同强度，12 位以上密码）
+async function hashPassword(password) {
+  const salt = randStr(16)
+  const hash = await hmacSign('pwd:' + password + ':' + salt, salt)
+  return { hash, salt }
+}
+
+// 校验钱包密码
+async function verifyWalletPassword(wallet, password) {
+  if (!wallet || !password) return false
+  const cred = await dbFirst('SELECT * FROM wallet_credentials WHERE wallet = ? AND status = ?', [wallet, 'active'])
+  if (!cred || !cred.password_hash || !cred.password_salt) return false
+  const hash = await hmacSign('pwd:' + password + ':' + cred.password_salt, cred.password_salt)
+  return hash === cred.password_hash
+}
+
+// 钱包签名验证（找回凭证用）：HMAC(challenge, wallet)，与 walletVerify 同模型，成功后消费该 challenge
+async function verifyWalletSignatureOnce(wallet, challenge, signature) {
+  if (!wallet || !challenge || !signature) return false
+  const sess = await dbFirst('SELECT * FROM auth_sessions WHERE wallet = ? AND challenge = ? AND status = ? AND challenge_expires > ?', [wallet, challenge, 'active', Date.now()])
+  if (!sess) return false
+  if (!await hmacVerify(challenge, signature, wallet)) return false
+  await dbRun('UPDATE auth_sessions SET status = ? WHERE session_id = ?', ['used', sess.session_id])
+  return true
+}
+
+// 设置/修改密码（可被 已鉴权接口 或 签名找回 调用）
+async function setWalletPassword(wallet, password) {
+  if (!password || password.length < 12) throw new Error('密码至少 12 位')
+  const { hash, salt } = await hashPassword(password)
+  await dbRun('UPDATE wallet_credentials SET password_hash = ?, password_salt = ?, password_set_at = ? WHERE wallet = ?', [hash, salt, Date.now(), wallet])
+}
+
+// 签发设备会话（账号密码登录复用）：同设备刷新，异设备新增
+async function issueDeviceSession(wallet, deviceId, deviceName) {
+  const now = Date.now()
+  const sessionId = 'DEV_' + randStr(8)
+  const sessionToken = await hmacSign(wallet + ':device:' + now + ':' + randStr(6), wallet)
+  const device = deviceName || '未命名设备'
+  const existing = await dbFirst('SELECT session_id FROM auth_sessions WHERE wallet = ? AND device_id = ? AND status = ?', [wallet, deviceId || '', 'active'])
+  if (existing) {
+    await dbRun('UPDATE auth_sessions SET session_token = ?, device_name = ?, status = ?, expires_at = ?, last_activity = ? WHERE session_id = ?',
+      [sessionToken, device, 'active', now + DEVICE_SESSION_TTL, now, existing.session_id])
+  } else {
+    await dbRun('INSERT INTO auth_sessions (session_id, wallet, agent_id, challenge, challenge_expires, session_token, status, created, expires_at, last_activity, device_id, device_name, ip_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [sessionId, wallet, '', '', 0, sessionToken, 'active', now, now + DEVICE_SESSION_TTL, now, deviceId || '', device, ''])
+  }
+  return { sessionToken, expiresIn: DEVICE_SESSION_TTL, device }
+}
+
+// POST /api/account/login：钱包 + 密码 → 签发设备会话（跨设备登录的密码通道）
+async function accountLogin(body) {
+  const { wallet, password, device_id, device_name } = body
+  if (!wallet || !password) return json({ error: 'wallet and password required' }, 400)
+  if (!await verifyWalletPassword(wallet, password)) return json({ error: '钱包或密码错误（未设置密码请用 API Key 登录）' }, 403)
+  await dbRun('UPDATE wallet_credentials SET last_auth = ?, auth_count = auth_count + 1 WHERE wallet = ?', [Date.now(), wallet])
+  const s = await issueDeviceSession(wallet, device_id || ('login_' + randStr(4)), device_name)
+  return json({ logged_in: true, session_token: s.sessionToken, device_id: device_id || '', device_name: s.device, expires_in: s.expiresIn, wallet: maskWallet(wallet), has_password: true, network_time: Date.now() })
+}
+
+// POST /api/account/password/set：已鉴权（api_key / session_token）设置或修改密码
+async function accountPasswordSet(body, url) {
+  const { wallet, password } = body
+  if (!wallet || !password) return json({ error: 'wallet and password required' }, 400)
+  const denied = await requireWalletAuth(url, wallet)
+  if (denied) return denied
+  try {
+    await setWalletPassword(wallet, password)
+  } catch (e) { return json({ error: e.message }, 400) }
+  return json({ updated: true, has_password: true, message: '密码已设置', network_time: Date.now() })
+}
+
+// POST /api/account/password/reset：钱包签名找回 → 重置密码（challenge 来自 /api/wallet/challenge）
+async function accountPasswordReset(body) {
+  const { wallet, challenge, signature, new_password } = body
+  if (!wallet || !challenge || !signature || !new_password) return json({ error: 'wallet, challenge, signature, new_password required' }, 400)
+  if (!await verifyWalletSignatureOnce(wallet, challenge, signature)) return json({ error: '签名验证失败或挑战已过期' }, 403)
+  try {
+    await setWalletPassword(wallet, new_password)
+  } catch (e) { return json({ error: e.message }, 400) }
+  await dbRun('INSERT INTO audit_log (id, wallet, agent_id, action, target, result, reason, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', ['AUD_' + randStr(6), wallet, '', 'account', 'password', 'success', '签名找回重置密码', Date.now()])
+  return json({ reset: true, message: '密码已通过钱包签名验证重置', network_time: Date.now() })
+}
+
+// POST /api/account/key/recover：钱包签名找回 → 返回完整 API Key（仅一次性消费签名）
+async function accountKeyRecover(body) {
+  const { wallet, challenge, signature } = body
+  if (!wallet || !challenge || !signature) return json({ error: 'wallet, challenge, signature required' }, 400)
+  if (!await verifyWalletSignatureOnce(wallet, challenge, signature)) return json({ error: '签名验证失败或挑战已过期' }, 403)
+  const key = await dbFirst('SELECT * FROM wallet_api_keys WHERE wallet = ? AND status = ?', [wallet, 'active'])
+  if (!key) return json({ error: '未找到该钱包的有效 API Key' }, 404)
+  await dbRun('INSERT INTO audit_log (id, wallet, agent_id, action, target, result, reason, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', ['AUD_' + randStr(6), wallet, '', 'account', 'api_key', 'success', '签名找回 API Key', Date.now()])
+  return json({ recovered: true, wallet: maskWallet(wallet), api_key: key.api_key, message: 'API Key 已通过钱包签名验证找回', network_time: Date.now() })
+}
+
+// GET /api/account/info：账号概览（邮箱掩码 / 密码状态 / 设备数 / Key 掩码）
+async function accountInfo(url) {
+  const wallet = url.searchParams.get('wallet') || ''
+  if (!wallet) return json({ error: 'wallet required' }, 400)
+  const denied = await requireWalletAuth(url, wallet)
+  if (denied) return denied
+  const cred = await dbFirst('SELECT * FROM wallet_credentials WHERE wallet = ?', [wallet])
+  const key = await dbFirst('SELECT api_key FROM wallet_api_keys WHERE wallet = ? AND status = ?', [wallet, 'active'])
+  const devices = await dbFirst('SELECT COUNT(*) as cnt FROM auth_sessions WHERE wallet = ? AND status = ?', [wallet, 'active'])
+  const email = cred?.email || ''
+  const maskedEmail = email ? email.replace(/^(.).*@/, m => m[0] + '***@') : ''
+  return json({
+    wallet: maskWallet(wallet), has_password: !!cred?.password_hash, password_set_at: cred?.password_set_at || 0,
+    email: maskedEmail, email_bound: !!email, api_key_masked: key ? key.api_key.slice(0, 3) + '…' + key.api_key.slice(-4) : '',
+    device_count: devices?.cnt || 0, network_time: Date.now()
+  })
+}
+
+// POST /api/account/email/bind：已鉴权绑定邮箱（找回提示用）
+async function accountEmailBind(body, url) {
+  const { wallet, email } = body
+  if (!wallet || !email) return json({ error: 'wallet and email required' }, 400)
+  const denied = await requireWalletAuth(url, wallet)
+  if (denied) return denied
+  const e = String(email).trim().slice(0, 120)
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) return json({ error: '邮箱格式不正确' }, 400)
+  await dbRun('UPDATE wallet_credentials SET email = ?, email_verified = ? WHERE wallet = ?', [e, 1, wallet])
+  return json({ bound: true, email: e.replace(/^(.).*@/, m => m[0] + '***@'), message: '邮箱已绑定（用于找回提示）', network_time: Date.now() })
 }
 
 async function walletInfo(url) {
