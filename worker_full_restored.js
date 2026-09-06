@@ -248,7 +248,7 @@ export default {
     await ensureTables()
     
     const startTime = Date.now()
-    const MAX_CRON_TIME = 25000 // 25秒超时保护（付费计划5分钟限制）
+    const MAX_CRON_TIME = 45000 // 45秒超时保护（付费计划5分钟限制，LLM 多钱包挖矿需要更多时间）
     const BATCH_SIZE = 50 // 每批处理数量
     
     // 超时检查
@@ -4820,7 +4820,7 @@ async function llmChat(messages, opts = {}) {
   const apiKey = await decryptLlmKey(cfg.api_key_enc)
   const base = (cfg.base_url || 'https://api.openai.com/v1').replace(/\/+$/, '')
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), 20000)
+  const timer = setTimeout(() => controller.abort(), opts.json ? 45000 : 30000)
   let res
   try {
     res = await fetch(base + '/chat/completions', {
