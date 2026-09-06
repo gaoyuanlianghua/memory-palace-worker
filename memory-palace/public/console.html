@@ -1218,18 +1218,22 @@ function currentPage() {
   return pages[hash] ? hash : 'dashboard';
 }
 
+let __renderSeq = 0;
 async function refresh() {
   const id = currentPage();
   const pg = pages[id];
   if (!pg) return;
+  const mySeq = ++__renderSeq; // 渲染令牌：并发 refresh 只有最新一趟能写 DOM
   document.querySelectorAll('.nav-item').forEach(n => n.classList.toggle('active', n.dataset.id === id));
   const pageEl = $('page');
   pageEl.innerHTML = spinner('加载 '+pg.title+'…');
+  let html;
   try {
-    pageEl.innerHTML = await pg.render();
+    html = await pg.render();
   } catch (e) {
-    pageEl.innerHTML = errBox(e);
+    html = errBox(e);
   }
+  if (mySeq === __renderSeq) pageEl.innerHTML = html;
 }
 
 async function refreshAll() {
