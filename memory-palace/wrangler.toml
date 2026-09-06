@@ -1,0 +1,34 @@
+name = "gyuanpalace-agent"
+main = "../worker_full_restored.js"
+compatibility_date = "2026-08-20"
+account_id = "ad75e8e45b6eeea0b0d6f7c97aeb83be"
+compatibility_flags = ["nodejs_compat"]
+
+# 自定义域名绑定（避免 workers.dev 被阻断）
+[[routes]]
+pattern = "agent.gyuanpalace.xyz/*"
+zone_name = "gyuanpalace.xyz"
+
+[vars]
+CHAIN_NAME = "GyuanPalace"
+PROTOCOL = "MemoryChain/1.0"
+
+[triggers]
+crons = ["* * * * *"]
+
+[[d1_databases]]
+binding = "gyuanpalace_db"
+database_name = "gyuanpalace-db"
+database_id = "6cfddbd9-eaf5-4220-bfe7-4005e53aa677"
+
+[[durable_objects.bindings]]
+name = "PALACE_CLONE"
+class_name = "PalaceClone"
+
+[[durable_objects.bindings]]
+name = "TASK_SCHEDULER"
+class_name = "TaskScheduler"
+
+[[kv_namespaces]]
+binding = "TASK_STATE"
+id = "4e44b54203424ec98b1769aed37c7514"
