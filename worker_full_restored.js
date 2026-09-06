@@ -528,11 +528,12 @@ const apiDocs = async () => {
         { method: 'POST', path: '/api/device/logout', params: { session_token: 'string' }, desc: '登出当前设备会话', auth: false },
         { method: 'POST', path: '/api/device/revoke', params: { wallet: 'string', device_id: 'string' }, desc: '强制下线指定设备', auth: 'wallet' },
         { method: 'POST', path: '/api/account/login', params: { wallet: 'string', password: 'string', device_id: 'string(可选)', device_name: 'string(可选)' }, desc: '账号密码登录：校验密码并签发设备会话', auth: false },
-        { method: 'POST', path: '/api/account/password/set', params: { wallet: 'string', password: 'string(≥12位)' }, desc: '设置/修改登录密码', auth: 'wallet' },
+        { method: 'POST', path: '/api/account/password/set', params: { wallet: 'string', password: 'string(≥12位)', email_code: 'string' }, desc: '设置/修改登录密码（需邮箱验证码，同自然月内不可与换邮箱叠加）', auth: 'wallet' },
         { method: 'POST', path: '/api/account/password/reset', params: { wallet: 'string', challenge: 'string', signature: 'string', new_password: 'string' }, desc: '钱包签名找回：重置密码', auth: false },
         { method: 'POST', path: '/api/account/key/recover', params: { wallet: 'string', challenge: 'string', signature: 'string' }, desc: '钱包签名找回：取回完整 API Key', auth: false },
         { method: 'GET', path: '/api/account/info', params: { wallet: 'string' }, desc: '账号概览：密码/邮箱/设备/Key 掩码状态', auth: 'wallet' },
-        { method: 'POST', path: '/api/account/email/bind', params: { wallet: 'string', email: 'string' }, desc: '绑定找回邮箱（提示用途）', auth: 'wallet' },
+        { method: 'POST', path: '/api/account/email/bind', params: { wallet: 'string', email: 'string', email_code: 'string' }, desc: '绑定/更换找回邮箱（需新邮箱验证码，同自然月内不可与改密叠加）', auth: 'wallet' },
+        { method: 'POST', path: '/api/account/verify/send', params: { wallet: 'string', action: 'password|email', email: 'string(action=email 时必填)' }, desc: '发送邮箱验证码（改密码发往绑定邮箱；换邮箱发往新邮箱）', auth: 'wallet' },
         { method: 'GET', path: '/api/wallet/info', params: {}, desc: '钱包列表（已加密掩码）', auth: false },
         { method: 'GET', path: '/api/wallet/status', params: { wallet: 'string' }, desc: '钱包状态（余额、注册时间）', auth: false },
         { method: 'GET', path: '/api/wallet/profile', params: { wallet: 'string' }, desc: '钱包详细资料', auth: 'wallet' },
@@ -1647,6 +1648,11 @@ async function ensureTables() {
       dbRun(`ALTER TABLE wallet_credentials ADD COLUMN password_set_at INTEGER DEFAULT 0`).catch(() => {}),
       dbRun(`ALTER TABLE wallet_credentials ADD COLUMN email TEXT`).catch(() => {}),
       dbRun(`ALTER TABLE wallet_credentials ADD COLUMN email_verified INTEGER DEFAULT 0`).catch(() => {}),
+      // 同月互斥保护：记录最近一次改密/换邮箱时间（幂等补列，兼容线上旧表）
+      dbRun(`ALTER TABLE wallet_credentials ADD COLUMN password_changed_at INTEGER DEFAULT 0`).catch(() => {}),
+      dbRun(`ALTER TABLE wallet_credentials ADD COLUMN email_changed_at INTEGER DEFAULT 0`).catch(() => {}),
+      // 邮件验证码：修改密码/更换邮箱前需通过邮箱验证（6 位码，10 分钟有效，一次性）
+      dbRun(`CREATE TABLE IF NOT EXISTS email_verify_codes (id TEXT PRIMARY KEY, wallet TEXT, action TEXT, email TEXT, code_hash TEXT, expires_at INTEGER, used INTEGER DEFAULT 0, created INTEGER)`),
       dbRun(`CREATE TABLE IF NOT EXISTS audit_log (id TEXT PRIMARY KEY, wallet TEXT, agent_id TEXT, action TEXT, target TEXT, result TEXT, reason TEXT, ip_hash TEXT, created INTEGER)`),
       dbRun(`CREATE TABLE IF NOT EXISTS events (event_id TEXT PRIMARY KEY, event_type TEXT, actor TEXT, data TEXT DEFAULT '{}', created INTEGER)`),
       dbRun(`CREATE TABLE IF NOT EXISTS memory_chains (chain_id TEXT PRIMARY KEY, agent_id TEXT, wallet TEXT, chain_data TEXT, chain_length INTEGER, compressed_bytes INTEGER, original_bytes INTEGER, level INTEGER DEFAULT 1, checksum TEXT, backup_path TEXT, created INTEGER, updated INTEGER)`),
@@ -2666,6 +2672,7 @@ async function handlePost(path, body, url) {
     '/api/account/password/reset': () => accountPasswordReset(body),
     '/api/account/key/recover': () => accountKeyRecover(body),
     '/api/account/email/bind': () => accountEmailBind(body, url),
+    '/api/account/verify/send': () => accountVerifySend(body, url),
     '/api/wallet/withdraw': () => walletWithdraw(body),
     '/api/wallet/deposit': () => walletDeposit(body),
     '/api/palace/command': () => palaceCommand(body),
@@ -3298,6 +3305,85 @@ async function verifyWalletSignatureOnce(wallet, challenge, signature) {
   return true
 }
 
+// ============================================================
+// 📧 邮件验证码：修改密码 / 更换邮箱前必须通过邮箱验证（Resend 发送，6 位码，10 分钟有效，一次性）
+// ============================================================
+const EMAIL_CODE_TTL = 10 * 60 * 1000 // 10 分钟
+const EMAIL_VERIFY_ACTIONS = ['password', 'email']
+
+// 发送验证码邮件（Resend API；未配置 RESEND_API_KEY 时返回 false，调用方提示）
+async function sendVerifyEmail(to, code, action) {
+  const apiKey = (ENV?.RESEND_API_KEY || '').trim()
+  if (!apiKey) return false
+  const from = (ENV?.RESEND_FROM || '').trim() || 'Memory Palace <noreply@gyuanpalace.xyz>'
+  const subject = action === 'password' ? '【记忆宫殿】修改登录密码验证码' : '【记忆宫殿】更换绑定邮箱验证码'
+  const body =
+    '<div style="font-family:sans-serif;max-width:520px;margin:0 auto;padding:24px;border:1px solid #e5e7eb;border-radius:12px">' +
+    '<h2 style="margin:0 0 8px;color:#1f2937">记忆宫殿 · 安全验证</h2>' +
+    '<p style="color:#6b7280;font-size:14px">你的验证码（10 分钟内有效）：</p>' +
+    '<p style="font-size:32px;letter-spacing:6px;font-weight:700;color:#5b8cff;margin:12px 0">' + code + '</p>' +
+    '<p style="color:#9ca3af;font-size:12px">若非本人操作请忽略此邮件，并立即检查你的钱包登录状态。</p>' +
+    '</div>'
+  try {
+    const r = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from, to: [to], subject, html: body })
+    })
+    if (!r.ok) { const t = await r.text(); console.error('resend send:', r.status, t.slice(0, 300)); return false }
+    return true
+  } catch (e) { console.error('resend send:', e.message); return false }
+}
+
+// 生成验证码并落库（同 wallet+action 复用，旧码作废）；返回 { sent, expires_in, masked_email }
+async function createEmailVerifyCode(wallet, action, email) {
+  const code = String(Math.floor(100000 + Math.random() * 900000))
+  const codeHash = await hmacSign(wallet + ':' + action + ':' + code, wallet + ':email_code')
+  const now = Date.now()
+  // 同钱包同动作的旧码全部作废，防止多码并发
+  await dbRun(`DELETE FROM email_verify_codes WHERE wallet = ? AND action = ?`, [wallet, action])
+  await dbRun(`INSERT INTO email_verify_codes (id, wallet, action, email, code_hash, expires_at, used, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ['EVC_' + randStr(6), wallet, action, email, codeHash, now + EMAIL_CODE_TTL, 0, now])
+  const sent = await sendVerifyEmail(email, code, action)
+  const masked = email.replace(/^(.).*@/, (m) => m[0] + '***@')
+  return { sent, expires_in: EMAIL_CODE_TTL, masked_email: masked }
+}
+
+// 校验验证码：正确则消费（一次性）
+async function consumeEmailVerifyCode(wallet, action, code) {
+  if (!EMAIL_VERIFY_ACTIONS.includes(action)) return false
+  const row = await dbFirst(`SELECT * FROM email_verify_codes WHERE wallet = ? AND action = ? AND used = 0 AND expires_at > ?`, [wallet, action, Date.now()])
+  if (!row) return false
+  const expect = await hmacSign(wallet + ':' + action + ':' + code, wallet + ':email_code')
+  if (expect !== row.code_hash) return false
+  await dbRun(`UPDATE email_verify_codes SET used = 1 WHERE id = ?`, [row.id])
+  return true
+}
+
+// 同月互斥保护：同一自然月内 密码 与 邮箱 只能修改一项，防止通过双通道同时篡改导致钱包丢失
+function isSameMonth(a, b) {
+  const da = new Date(a), db = new Date(b)
+  return da.getUTCFullYear() === db.getUTCFullYear() && da.getUTCMonth() === db.getUTCMonth()
+}
+// 修改密码前检查：本自然月是否已更换过邮箱
+async function ensurePwdChangeAllowed(wallet) {
+  const cred = await dbFirst('SELECT email_changed_at FROM wallet_credentials WHERE wallet = ?', [wallet])
+  const changed = cred?.email_changed_at || 0
+  if (changed && isSameMonth(changed, Date.now())) {
+    return { allowed: false, reason: '本自然月已更换过绑定邮箱，为避免钱包被篡改风险，修改密码需下月再进行' }
+  }
+  return { allowed: true }
+}
+// 更换邮箱前检查：本自然月是否已修改过密码
+async function ensureEmailChangeAllowed(wallet) {
+  const cred = await dbFirst('SELECT password_changed_at FROM wallet_credentials WHERE wallet = ?', [wallet])
+  const changed = cred?.password_changed_at || 0
+  if (changed && isSameMonth(changed, Date.now())) {
+    return { allowed: false, reason: '本自然月已修改过登录密码，为避免钱包被篡改风险，更换邮箱需下月再进行' }
+  }
+  return { allowed: true }
+}
+
 // 设置/修改密码（可被 已鉴权接口 或 签名找回 调用）
 async function setWalletPassword(wallet, password) {
   if (!password || password.length < 12) throw new Error('密码至少 12 位')
@@ -3333,15 +3419,21 @@ async function accountLogin(body) {
 }
 
 // POST /api/account/password/set：已鉴权（api_key / session_token）设置或修改密码
+// 需邮箱验证码：action=password 的验证码（发往绑定邮箱）；同自然月内已更换邮箱则拒绝
 async function accountPasswordSet(body, url) {
-  const { wallet, password } = body
+  const { wallet, password, email_code } = body
   if (!wallet || !password) return json({ error: 'wallet and password required' }, 400)
   const denied = await requireWalletAuth(url, wallet)
   if (denied) return denied
+  const check = await ensurePwdChangeAllowed(wallet)
+  if (!check.allowed) return json({ error: check.reason }, 429)
+  if (!email_code) return json({ error: '修改密码需先完成邮箱验证（POST /api/account/verify/send）并提交验证码' }, 400)
+  if (!await consumeEmailVerifyCode(wallet, 'password', String(email_code).trim())) return json({ error: '邮箱验证码无效或已过期' }, 403)
   try {
     await setWalletPassword(wallet, password)
   } catch (e) { return json({ error: e.message }, 400) }
-  return json({ updated: true, has_password: true, message: '密码已设置', network_time: Date.now() })
+  await dbRun('UPDATE wallet_credentials SET password_changed_at = ? WHERE wallet = ?', [Date.now(), wallet])
+  return json({ updated: true, has_password: true, message: '密码已设置（邮箱已验证）', network_time: Date.now() })
 }
 
 // POST /api/account/password/reset：钱包签名找回 → 重置密码（challenge 来自 /api/wallet/challenge）
@@ -3385,16 +3477,44 @@ async function accountInfo(url) {
   })
 }
 
-// POST /api/account/email/bind：已鉴权绑定邮箱（找回提示用）
+// POST /api/account/email/bind：已鉴权绑定/更换邮箱
+// 需邮箱验证码：action=email 的验证码（发往新邮箱）；同自然月内已修改密码则拒绝
 async function accountEmailBind(body, url) {
-  const { wallet, email } = body
+  const { wallet, email, email_code } = body
   if (!wallet || !email) return json({ error: 'wallet and email required' }, 400)
   const denied = await requireWalletAuth(url, wallet)
   if (denied) return denied
   const e = String(email).trim().slice(0, 120)
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) return json({ error: '邮箱格式不正确' }, 400)
-  await dbRun('UPDATE wallet_credentials SET email = ?, email_verified = ? WHERE wallet = ?', [e, 1, wallet])
-  return json({ bound: true, email: e.replace(/^(.).*@/, m => m[0] + '***@'), message: '邮箱已绑定（用于找回提示）', network_time: Date.now() })
+  const check = await ensureEmailChangeAllowed(wallet)
+  if (!check.allowed) return json({ error: check.reason }, 429)
+  if (!email_code) return json({ error: '更换邮箱需先完成新邮箱验证（POST /api/account/verify/send）并提交验证码' }, 400)
+  if (!await consumeEmailVerifyCode(wallet, 'email', String(email_code).trim())) return json({ error: '邮箱验证码无效或已过期' }, 403)
+  await dbRun('UPDATE wallet_credentials SET email = ?, email_verified = ?, email_changed_at = ? WHERE wallet = ?', [e, 1, Date.now(), wallet])
+  return json({ bound: true, email: e.replace(/^(.).*@/, m => m[0] + '***@'), message: '邮箱已绑定/更换（新邮箱已验证）', network_time: Date.now() })
+}
+
+// POST /api/account/verify/send：已鉴权发送邮箱验证码
+// action=password → 发往绑定邮箱（用于改密码）；action=email → 发往 body.email 新邮箱（用于换邮箱）
+async function accountVerifySend(body, url) {
+  const { wallet, action, email } = body
+  if (!wallet || !action) return json({ error: 'wallet and action required' }, 400)
+  if (!EMAIL_VERIFY_ACTIONS.includes(action)) return json({ error: 'action 仅支持 password / email' }, 400)
+  const denied = await requireWalletAuth(url, wallet)
+  if (denied) return denied
+  let target = ''
+  if (action === 'password') {
+    const cred = await dbFirst('SELECT email FROM wallet_credentials WHERE wallet = ?', [wallet])
+    target = (cred?.email || '').trim()
+    if (!target) return json({ error: '该钱包尚未绑定邮箱，无法发送验证码（请先绑定邮箱）' }, 400)
+  } else {
+    target = String(email || '').trim().slice(0, 120)
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(target)) return json({ error: '邮箱格式不正确' }, 400)
+  }
+  const r = await createEmailVerifyCode(wallet, action, target)
+  return json({ sent: r.sent, action, expires_in: r.expires_in, masked_email: r.masked_email,
+    message: r.sent ? '验证码已发送至邮箱，10 分钟内有效' : '邮件服务未配置（RESEND_API_KEY），验证码已生成但无法发送',
+    network_time: Date.now() })
 }
 
 async function walletInfo(url) {

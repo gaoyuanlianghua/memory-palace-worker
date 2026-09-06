@@ -1080,7 +1080,8 @@ pages.account = {
     out.push(card('找回方式','🛟', '忘记密码或丢失 API Key 时可用以下方式找回',
       '<div class="kv"><span class="k">方式一 · 密码登录</span><span class="v">POST /api/account/login（需已设置密码）</span></div>'+
       '<div class="kv"><span class="k">方式二 · API Key 登录</span><span class="v">POST /api/device/login（需保存 API Key）</span></div>'+
-      '<div class="kv"><span class="k">方式三 · 钱包签名找回</span><span class="v">challenge → 签名验证 → 重置密码 / 取回 API Key（无需任何密码或 Key）</span></div>'));
+      '<div class="kv"><span class="k">方式三 · 钱包签名找回</span><span class="v">challenge → 签名验证 → 重置密码 / 取回 API Key（无需任何密码或 Key）</span></div>'+
+      '<div class="sub" style="margin-top:10px">🔒 安全策略：修改密码 / 更换邮箱均需邮箱验证码，且同一自然月内两项只能操作其一，防止钱包凭证被整体篡改</div>'));
 
     out.push(card('已登录设备','📱', '每台设备独立会话，可远程下线',
       '<div id="acctDevPanel">'+spinner('加载设备列表…')+'</div>'));
@@ -1252,35 +1253,77 @@ async function doResetPwd() {
     toast('密码已重置，请用新密码登录','ok'); closeModal();
   } catch(e) { toast(e.message,'err'); }
 }
-/* 修改密码（已登录，需 api_key 或 session_token 鉴权） */
+/* 修改密码（已登录，需 api_key 或 session_token 鉴权 + 邮箱验证码） */
+let __pwdCodeSent = 0;
 function openSetPwd() {
-  openModal('设置/修改密码','用于密码通道登录（≥12 位）',
+  __pwdCodeSent = 0;
+  openModal('设置/修改密码','需邮箱验证码，且同自然月内不可与更换邮箱叠加（≥12 位）',
     '<div class="field"><label>新密码</label><input id="spPwd" type="password" placeholder="至少 12 位"></div>'+
-    '<div class="field"><label>确认密码</label><input id="spPwd2" type="password" placeholder="再次输入"></div>',
+    '<div class="field"><label>确认密码</label><input id="spPwd2" type="password" placeholder="再次输入"></div>'+
+    '<div class="field"><label>邮箱验证码</label><div class="frow" style="gap:6px"><input id="spCode" placeholder="6 位验证码（发往绑定邮箱）"><button class="btn btn-sm" id="spSendBtn" onclick="sendSetPwdCode()">发送验证码</button></div><div id="spCodeMsg" class="sub" style="margin-top:4px"></div></div>',
     '<button class="btn btn-ghost" onclick="closeModal()">取消</button><button class="btn" onclick="doSetPwd()">保存</button>');
 }
-async function doSetPwd() {
-  const p1 = q('spPwd').value, p2 = q('spPwd2').value;
-  if (p1.length < 12) return toast('密码至少 12 位','err');
-  if (p1 !== p2) return toast('两次密码不一致','err');
+async function sendSetPwdCode() {
+  if (!store.wallet) return toast('请先登录','err');
+  const btn = $('spSendBtn');
+  if (btn.disabled) return;
   try {
-    const d = await api('POST','/api/account/password/set',{wallet: store.wallet, password: p1});
-    if (!d.updated) { toast(d.error || '保存失败','err'); return; }
-    toast('密码已保存','ok'); closeModal(); renderAccountPanel();
+    const d = await api('POST','/api/account/verify/send',{wallet: store.wallet, action: 'password'});
+    __pwdCodeSent = Date.now();
+    $('spCodeMsg').innerHTML = d.sent ? '✅ 验证码已发送至 '+esc(d.masked_email)+'（10 分钟内有效）'
+      : '⚠️ 邮件服务未配置（RESEND_API_KEY），无法发送验证码';
+    if (d.sent) {
+      btn.disabled = true;
+      let left = 60; const t = setInterval(() => { btn.textContent = '重新发送('+(--left)+'s)'; if (left<=0){ clearInterval(t); btn.disabled=false; btn.textContent='发送验证码'; } }, 1000);
+    }
+    if (!d.sent) toast(d.message || '发送失败','warn');
   } catch(e) { toast(e.message,'err'); }
 }
+async function doSetPwd() {
+  const p1 = q('spPwd').value, p2 = q('spPwd2').value, code = q('spCode').value.trim();
+  if (p1.length < 12) return toast('密码至少 12 位','err');
+  if (p1 !== p2) return toast('两次密码不一致','err');
+  if (!code) return toast('请先获取并填写邮箱验证码','err');
+  try {
+    const d = await api('POST','/api/account/password/set',{wallet: store.wallet, password: p1, email_code: code});
+    if (!d.updated) { toast(d.error || '保存失败','err'); return; }
+    toast('密码已保存（邮箱已验证）','ok'); closeModal(); renderAccountPanel();
+  } catch(e) { toast(e.message,'err'); }
+}
+let __emailCodeSent = 0;
 function openBindEmail() {
-  openModal('绑定/更换邮箱','用于找回提示（不会发送验证邮件），已绑定邮箱将被替换',
-    '<div class="field"><label>邮箱</label><input id="beEmail" placeholder="you@example.com"></div>',
+  __emailCodeSent = 0;
+  openModal('绑定/更换邮箱','新邮箱需验证码验证，且同自然月内不可与修改密码叠加',
+    '<div class="field"><label>新邮箱</label><input id="beEmail" placeholder="you@example.com"></div>'+
+    '<div class="field"><label>邮箱验证码</label><div class="frow" style="gap:6px"><input id="beCode" placeholder="6 位验证码（发往新邮箱）"><button class="btn btn-sm" id="beSendBtn" onclick="sendBindEmailCode()">发送验证码</button></div><div id="beCodeMsg" class="sub" style="margin-top:4px"></div></div>',
     '<button class="btn btn-ghost" onclick="closeModal()">取消</button><button class="btn" onclick="doBindEmail()">保存</button>');
 }
-async function doBindEmail() {
-  const email = q('beEmail').trim();
-  if (!email) return toast('请填写邮箱','err');
+async function sendBindEmailCode() {
+  const email = q('beEmail').value.trim();
+  if (!email) return toast('请先填写新邮箱','err');
+  const btn = $('beSendBtn');
+  if (btn.disabled) return;
   try {
-    const d = await api('POST','/api/account/email/bind',{wallet: store.wallet, email});
+    const d = await api('POST','/api/account/verify/send',{wallet: store.wallet, action: 'email', email});
+    __emailCodeSent = Date.now();
+    $('beCodeMsg').innerHTML = d.sent ? '✅ 验证码已发送至 '+esc(d.masked_email)+'（10 分钟内有效）'
+      : '⚠️ 邮件服务未配置（RESEND_API_KEY），无法发送验证码';
+    if (d.sent) {
+      btn.disabled = true;
+      let left = 60; const t = setInterval(() => { btn.textContent = '重新发送('+(--left)+'s)'; if (left<=0){ clearInterval(t); btn.disabled=false; btn.textContent='发送验证码'; } }, 1000);
+    }
+    if (!d.sent) toast(d.message || '发送失败','warn');
+  } catch(e) { toast(e.message,'err'); }
+}
+async function doBindEmail() {
+  const email = q('beEmail').value.trim();
+  const code = q('beCode').value.trim();
+  if (!email) return toast('请填写新邮箱','err');
+  if (!code) return toast('请先获取并填写新邮箱验证码','err');
+  try {
+    const d = await api('POST','/api/account/email/bind',{wallet: store.wallet, email, email_code: code});
     if (!d.bound) { toast(d.error || '绑定失败','err'); return; }
-    toast('邮箱已绑定/更换','ok'); closeModal(); renderAccountPanel();
+    toast('邮箱已绑定/更换（已验证）','ok'); closeModal(); renderAccountPanel();
   } catch(e) { toast(e.message,'err'); }
 }
 
