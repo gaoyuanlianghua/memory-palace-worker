@@ -74,6 +74,37 @@ async function walletKeysList() {
   })
 }
 
+// 管理员：全部钱包账号概览（密码状态 / 绑定邮箱 / API Key / 找回方式）
+// 注意：密码为加盐哈希存储，任何角色（含管理员）都无法查看原始密码
+async function adminWalletList() {
+  const rows = await dbGet(`SELECT w.wallet, w.balance, w.agent_id, w.registered_at,
+      c.password_hash, c.password_set_at, c.email,
+      k.api_key
+    FROM wallets w
+    LEFT JOIN wallet_credentials c ON w.wallet = c.wallet
+    LEFT JOIN wallet_api_keys k ON w.wallet = k.wallet AND k.status = 'active'
+    ORDER BY w.registered_at DESC`)
+  return json({
+    wallets: rows.map(w => ({
+      wallet: w.wallet,
+      registered_at: w.registered_at,
+      balance: w.balance,
+      agent_id: w.agent_id || '',
+      has_password: !!w.password_hash,
+      password_set_at: w.password_set_at || 0,
+      email: w.email || '',
+      api_key: w.api_key || '',
+      recover_methods: [
+        w.password_hash ? '密码登录（POST /api/account/login）' : null,
+        w.api_key ? 'API Key 登录（POST /api/device/login）' : null,
+        '钱包签名找回（challenge-verify → 重置密码 / 取回 API Key）'
+      ].filter(Boolean)
+    })),
+    count: rows.length,
+    network_time: Date.now()
+  })
+}
+
 // 分身列表
 async function clonesList(url) {
   const wallet = url.searchParams.get('wallet')
@@ -510,7 +541,8 @@ const apiDocs = async () => {
         { method: 'POST', path: '/api/wallet/deposit', params: { wallet: 'string', amount: 'number' }, desc: '从公池充值（1%手续费）', auth: 'wallet' },
         { method: 'POST', path: '/api/wallet/rotate-key', params: { wallet: 'string' }, desc: '轮换 API 密钥', auth: 'wallet' },
         { method: 'POST', path: '/api/wallet/regenerate-key', params: { wallet: 'string' }, desc: '重新生成 API 密钥', auth: 'wallet' },
-        { method: 'GET', path: '/api/wallet/keys', params: {}, desc: '查看当前密钥列表', auth: 'wallet' }
+        { method: 'GET', path: '/api/wallet/keys', params: {}, desc: '查看当前密钥列表（全部钱包）', auth: 'admin' },
+        { method: 'GET', path: '/api/admin/wallets', params: {}, desc: '全部钱包账号概览（密码状态/邮箱/Key/找回方式）', auth: 'admin' },
       ],
       agent: [
         { method: 'POST', path: '/api/agent/bind', params: { agent_id: 'string', wallet: 'string', rooms: 'string[]' }, desc: '绑定智能体身份到钱包', auth: 'wallet' },
@@ -2879,6 +2911,11 @@ async function handleGet(path, url) {
       const denied = requireAdmin(url)
       if (denied) return denied
       return adminAudit(url)
+    },
+    '/api/admin/wallets': async () => {
+      const denied = requireAdmin(url)
+      if (denied) return denied
+      return adminWalletList()
     },
   }
   // 钱包密钥列表为敏感数据，需管理员密钥
