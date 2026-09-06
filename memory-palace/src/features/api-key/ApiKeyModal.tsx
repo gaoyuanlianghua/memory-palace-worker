@@ -6,6 +6,8 @@ import { useAppStore } from '../../app/store/appStore';
 export function ApiKeyModal({ open, onClose }: { open: boolean; onClose: () => void }) {
   const [input, setInput] = useState('');
   const refreshKey = useAppStore((s) => s.refreshKey);
+  const isAdmin = useAppStore((s) => s.isAdmin);
+  const adminChecked = useAppStore((s) => s.adminChecked);
 
   const save = () => {
     if (!input.trim()) return;
@@ -18,7 +20,16 @@ export function ApiKeyModal({ open, onClose }: { open: boolean; onClose: () => v
   return (
     <Modal open={open} onClose={onClose} title="🔐 API Key 配置">
       <p className="text-sm text-gray-400 mb-4">
-        当前身份：<span className="text-blue-400">🔑 节点操作员</span>
+        当前身份：
+        {adminChecked ? (
+          isAdmin ? (
+            <span className="text-green-400">🛡️ 管理员</span>
+          ) : (
+            <span className="text-blue-400">🔑 节点操作员</span>
+          )
+        ) : (
+          <span className="text-gray-500">检测中...</span>
+        )}
       </p>
       <div className="mb-4">
         <label className="block text-sm font-medium text-gray-300 mb-2">或输入自定义 API Key</label>

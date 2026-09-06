@@ -1,5 +1,5 @@
-import { NavLink, Outlet } from 'react-router-dom';
-import { useState } from 'react';
+import { NavLink, Outlet, useLocation } from 'react-router-dom';
+import { useEffect, useState } from 'react';
 import { useAppStore } from '../store/appStore';
 import { ApiKeyModal } from '../../features/api-key';
 import { APP_VERSION } from '../../shared/utils/constants';
@@ -19,6 +19,14 @@ const navItems = [
 export function AppLayout() {
   const [showKey, setShowKey] = useState(false);
   const keyText = useAppStore((s) => s.keyText);
+  const location = useLocation();
+  const [bannerVisible, setBannerVisible] = useState(true);
+  const adminDenied = location.state?.adminDenied === true;
+
+  // 每次导航后重置横幅可见性
+  useEffect(() => {
+    setBannerVisible(true);
+  }, [location.key]);
 
   return (
     <div className="min-h-screen bg-gray-900 text-white">
@@ -70,6 +78,23 @@ export function AppLayout() {
           </div>
         </div>
       </nav>
+
+      {adminDenied && bannerVisible && (
+        <div className="bg-amber-500/10 border-b border-amber-500/30">
+          <div className="max-w-7xl mx-auto px-4 py-2 flex items-center justify-between gap-4">
+            <p className="text-sm text-amber-300">
+              ⛔ 当前 API Key 无管理员权限，已返回仪表盘。请在右上角配置具有管理员权限的 API Key。
+            </p>
+            <button
+              onClick={() => setBannerVisible(false)}
+              className="text-amber-300/70 hover:text-amber-200 text-sm shrink-0"
+              aria-label="关闭提示"
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+      )}
 
       <main className="max-w-7xl mx-auto px-4 py-6">
         <Outlet />
