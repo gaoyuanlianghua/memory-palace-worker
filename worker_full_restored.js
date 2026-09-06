@@ -246,6 +246,7 @@ export default {
   async scheduled(event, env) {
     ENV = env
     await ensureTables()
+    await taskTitleLocalize()
     
     const startTime = Date.now()
     const MAX_CRON_TIME = 45000 // 45秒超时保护（付费计划5分钟限制，LLM 多钱包挖矿需要更多时间）
@@ -4401,6 +4402,19 @@ async function poolAirdrop() {
     await dbRun('INSERT INTO pool_transactions (id, wallet, type, amount, pool_balance_before, pool_balance_after, description, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', ['TX_' + randStr(6), node.wallet, 'airdrop', reward, pool, newPool, '算力加权空投', Date.now()])
   }
   await dbRun('INSERT OR REPLACE INTO system (key, value) VALUES (?, ?)', ['system_pool', String(newPool)])
+}
+
+// 迁移：存量英文/乱码任务标题统一中文化（历史数据一次性修正，scheduled 每次执行幂等）
+async function taskTitleLocalize() {
+  try {
+    // 存量英文 Memory mining 任务 → 中文
+    await dbRun(`UPDATE tasks SET title = '记忆挖矿：整理对话片段' WHERE title = 'Memory mining: organize conversation segments'`)
+    await dbRun(`UPDATE tasks SET title = '记忆挖矿：汇总每日日志' WHERE title = 'Memory mining: summarize daily logs'`)
+    await dbRun(`UPDATE tasks SET title = '记忆挖矿：提取关键决策' WHERE title = 'Memory mining: extract key decisions'`)
+    await dbRun(`UPDATE tasks SET title = '记忆挖矿：发现上下文模式' WHERE title = 'Memory mining: find patterns in context'`)
+    // 存量 PoW 乱码/英文标题 → 节点记忆挖矿（保留 D 难度）
+    await dbRun(`UPDATE tasks SET title = '节点记忆挖矿 D=2' WHERE task_id LIKE 'TASK_POW_%' AND title LIKE 'PoW %'`)
+  } catch(e) {}
 }
 
 async function poolCreatePowTask() {
