@@ -2798,6 +2798,11 @@ async function handleGet(path, url) {
       return llmConfigGet(url)
     },
     '/api/llm/stats': () => llmStatsGet(url),
+    '/api/admin/audit': async () => {
+      const denied = requireAdmin(url)
+      if (denied) return denied
+      return adminAudit(url)
+    },
   }
   // 钱包密钥列表为敏感数据，需管理员密钥
   if (path === '/api/wallet/keys') {
@@ -4873,9 +4878,12 @@ async function llmTaskMining(maxCalls, wallet) {
         { role: 'user', content: `任务：${task.title}\n要求：${task.description || '无'}\n所在房间：${task.room || 'general'}\n请输出完成结果。` }
       ], { task_type: 'task_complete', wallet: agent.wallet, target_id: task.task_id, max_tokens: 500 })
       calls++
-      await taskComplete({ task_id: task.task_id, agent_id: task.claimed_by, result: truncateStr(r.content, 800) })
+      const compRes = await taskComplete({ task_id: task.task_id, agent_id: task.claimed_by, result: truncateStr(r.content, 800) })
+      const comp = await compRes.json().catch(() => null)
+      const rewardMc = comp?.final_reward || 0
+      const rewardExp = rewardMc * 10
       await dbRun('INSERT INTO llm_mining_log (task_type, wallet, target_id, input_summary, output_summary, reward_mc, reward_exp, status, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        ['task_complete', agent.wallet, task.task_id, truncateStr(task.title, 100), truncateStr(r.content, 200), 0, 0, 'success', Date.now()])
+        ['task_complete', agent.wallet, task.task_id, truncateStr(task.title, 100), truncateStr(r.content, 200), rewardMc, rewardExp, 'success', Date.now()])
       completed++
     } catch(e) {
       await dbRun('INSERT INTO llm_mining_log (task_type, wallet, target_id, input_summary, output_summary, status, error_message, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
@@ -4902,9 +4910,12 @@ async function llmTaskMining(maxCalls, wallet) {
             { role: 'user', content: `任务：${task.title}\n要求：${task.description || '无'}\n所在房间：${task.room || 'general'}\n请输出完成结果。` }
           ], { task_type: 'task_complete', wallet: best.wallet, target_id: task.task_id, max_tokens: 500 })
           calls++
-          await taskComplete({ task_id: task.task_id, agent_id: best.agent_id, wallet: best.wallet, result: truncateStr(r.content, 800) })
+          const compRes2 = await taskComplete({ task_id: task.task_id, agent_id: best.agent_id, wallet: best.wallet, result: truncateStr(r.content, 800) })
+          const comp2 = await compRes2.json().catch(() => null)
+          const rewardMc2 = comp2?.final_reward || 0
+          const rewardExp2 = rewardMc2 * 10
           await dbRun('INSERT INTO llm_mining_log (task_type, wallet, target_id, input_summary, output_summary, reward_mc, reward_exp, status, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            ['task_auto_complete', best.wallet, task.task_id, truncateStr(task.title, 100), truncateStr(r.content, 200), 0, 0, 'success', Date.now()])
+            ['task_auto_complete', best.wallet, task.task_id, truncateStr(task.title, 100), truncateStr(r.content, 200), rewardMc2, rewardExp2, 'success', Date.now()])
           completed++
         } catch(e) {
           await dbRun('INSERT INTO llm_mining_log (task_type, wallet, target_id, input_summary, output_summary, status, error_message, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
@@ -5057,6 +5068,30 @@ async function llmStatsGet(url) {
     recent_logs: logs,
     network_time: Date.now()
   })
+}
+
+// 管理员只读审计：按钱包/分身聚合链路上全部真实数据（供验证任务/知识点真实性）
+async function adminAudit(url) {
+  const wallet = url?.searchParams?.get('wallet') || ''
+  const agent = url?.searchParams?.get('agent_id') || ''
+  if (!wallet && !agent) return json({ error: 'wallet or agent_id required' }, 400)
+  const out = { network_time: Date.now() }
+  const q = async (sql, params) => (await dbGet(sql, params)) || []
+  if (wallet) {
+    out.wallet = await dbFirst('SELECT wallet, balance, agent_id, registered_at FROM wallets WHERE wallet = ?', [wallet])
+    out.agents = await q('SELECT agent_id, balance, experience, resurrection_level, status, created FROM agents WHERE wallet = ? ORDER BY created ASC', [wallet])
+    out.knowledge = await q('SELECT knowledge_id, source_type, source_id, content, knowledge_type, quality_score, reward_mc, reward_exp, usage_count, created, mined FROM memory_knowledge WHERE wallet = ? ORDER BY created DESC LIMIT 100', [wallet])
+    out.llm_logs = await q('SELECT task_type, target_id, input_summary, output_summary, reward_mc, reward_exp, status, error_message, created FROM llm_mining_log WHERE wallet = ? ORDER BY created DESC LIMIT 100', [wallet])
+    out.llm_usage = await q('SELECT task_type, model, target_id, input_tokens, output_tokens, cost_usd, status, error_message, created FROM llm_usage WHERE wallet = ? ORDER BY created DESC LIMIT 100', [wallet])
+    out.tool_calls = await q('SELECT id, tool_name, result_status, mined_at, created FROM tool_call_log WHERE wallet = ? ORDER BY created DESC LIMIT 50', [wallet])
+    out.contexts = await q('SELECT context_id, user_message, optimization_score, analyzed, created FROM conversation_context WHERE wallet = ? ORDER BY created DESC LIMIT 50', [wallet])
+    out.dialog_cache = await q('SELECT id, agent_id, score, usage_count, created FROM dialog_cache WHERE wallet = ? ORDER BY created DESC LIMIT 50', [wallet])
+  }
+  if (agent) {
+    out.agent = await dbFirst('SELECT * FROM agents WHERE agent_id = ?', [agent])
+    out.tasks = await q('SELECT task_id, title, reward, room, status, claimed_by, completed_by, created, deadline, result FROM tasks WHERE claimed_by = ? OR completed_by = ? ORDER BY created DESC LIMIT 100', [agent, agent])
+  }
+  return json(out)
 }
 
 async function miningSync(body) {
