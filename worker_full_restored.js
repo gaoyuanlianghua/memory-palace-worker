@@ -4429,6 +4429,13 @@ async function poolCreatePowTask() {
   } catch(e) {}
   const existing = await dbFirst('SELECT COUNT(*) as count FROM tasks WHERE task_id LIKE ? AND status = ?', ['TASK_POW_%', 'active'])
   if (existing && existing.count >= 2) return
+  // 检查记忆点原料：原料为空时不应发布「节点记忆挖矿」任务（避免空挖）
+  const raw = await dbFirst(`SELECT
+    (SELECT COUNT(*) FROM conversation_context WHERE optimization_score IS NULL OR optimization_score < 50) +
+    (SELECT COUNT(*) FROM tool_call_log WHERE mined_at IS NULL) +
+    (SELECT COUNT(*) FROM memory_knowledge WHERE mined = 1 AND (blocked IS NULL OR blocked = 0)) +
+    (SELECT COUNT(*) FROM memory_blocks WHERE (cored IS NULL OR cored = 0)) AS total`)
+  if (!raw || !raw.total || raw.total < 3) return
   const rewardRow = await dbFirst('SELECT value FROM strategies WHERE key = ?', ['pow_task_reward'])
   const baseReward = parseFloat(rewardRow?.value || '1.0')
   const nodes = await dbGet('SELECT * FROM wallet_nodes WHERE status = ?', ['online'])
