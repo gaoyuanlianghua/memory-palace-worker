@@ -2798,6 +2798,13 @@ async function handleGet(path, url) {
       return llmConfigGet(url)
     },
     '/api/llm/stats': () => llmStatsGet(url),
+    '/api/audit/wallet': async () => {
+      // 分身功能：用钱包自己的 API Key 验证本钱包链路上的任务/知识点真实性（不需要管理员权限）
+      const wallet = url.searchParams.get('wallet')
+      const denied = await requireWalletAuth(url, wallet)
+      if (denied) return denied
+      return adminAudit(url, true)
+    },
     '/api/admin/audit': async () => {
       const denied = requireAdmin(url)
       if (denied) return denied
