@@ -4423,6 +4423,10 @@ async function taskTitleLocalize() {
 }
 
 async function poolCreatePowTask() {
+  // 清理过期未认领任务：超过 deadline 的 active 任务标记为 expired，避免僵尸任务卡住任务池
+  try {
+    await dbRun(`UPDATE tasks SET status = 'expired' WHERE status = 'active' AND deadline < ?`, [Date.now()])
+  } catch(e) {}
   // 迁移：历史活跃任务的旧标题「PoW 挖矿任务」统一更名为「节点记忆挖矿」
   try {
     await dbRun(`UPDATE tasks SET title = replace(title, 'PoW 挖矿任务', '节点记忆挖矿') WHERE task_id LIKE 'TASK_POW_%' AND status = 'active'`)
