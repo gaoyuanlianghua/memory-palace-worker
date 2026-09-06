@@ -1697,6 +1697,8 @@ async function ensureTables() {
     ])
     // 迁移：旧版 llm_config 无 wallet 字段，补充默认空钱包（兼容已部署库）
     try { await dbRun(`ALTER TABLE llm_config ADD COLUMN wallet TEXT DEFAULT ''`) } catch(e) {}
+    // 迁移：旧版 tool_call_log 无 mined_at 列，原料生成挖矿依赖该列
+    try { await dbRun(`ALTER TABLE tool_call_log ADD COLUMN mined_at INTEGER`) } catch(e) {}
     
     // 初始化数据
     await Promise.all([
@@ -2661,8 +2663,8 @@ async function handlePost(path, body, url) {
     '/api/llm/config': async () => {
       const denied = await requireWalletAuth(url, body?.wallet)
       if (denied) return denied
-      if (body && Object.keys(body).length > 0) return json(await llmConfigSet(body))
-      return json(await llmConfigGet(url))
+      if (body && Object.keys(body).length > 0) return llmConfigSet(body)
+      return llmConfigGet(url)
     },
     '/api/llm/run': async () => {
       const denied = await requireWalletAuth(url, body?.wallet)
