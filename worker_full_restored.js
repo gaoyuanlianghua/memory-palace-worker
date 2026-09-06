@@ -4926,7 +4926,7 @@ async function llmMemoryOptimize(maxCalls) {
         const qs = Math.min(100, computeQualityScore(optimizedPrompt, 'dialog') + 15)
         const reward = rewardForQuality(qs)
         await dbRun('INSERT INTO memory_knowledge (knowledge_id, wallet, agent_id, source_type, source_id, content, content_hash, knowledge_type, quality_score, reward_mc, reward_exp, usage_count, last_accessed, created, mined) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-          ['KNOW_' + randStr(8), d.wallet, '', 'llm_optimized', d.context_id, optimizedPrompt, hash, 'intent', qs, reward.mc, reward.exp, 1, Date.now(), Date.now(), 1)
+          ['KNOW_' + randStr(8), d.wallet, '', 'llm_optimized', d.context_id, optimizedPrompt, hash, 'intent', qs, reward.mc, reward.exp, 1, Date.now(), Date.now(), 1])
         await dbRun('UPDATE wallets SET balance = balance + ? WHERE wallet = ?', [reward.mc, d.wallet])
       }
       await dbRun('INSERT INTO llm_mining_log (task_type, wallet, target_id, input_summary, output_summary, reward_mc, reward_exp, status, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
