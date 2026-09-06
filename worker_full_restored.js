@@ -544,7 +544,7 @@ const apiDocs = async () => {
         { method: 'POST', path: '/api/task/create_optimize', params: { title: 'string', difficulty: 'normal|medium|hard', wallet: 'string' }, desc: '创建优化任务', auth: 'wallet' },
         { method: 'POST', path: '/api/task/claim', params: { task_id: 'string', wallet: 'string' }, desc: '领取任务', auth: 'wallet' },
         { method: 'POST', path: '/api/task/complete', params: { task_id: 'string', wallet: 'string', result: 'object' }, desc: '完成任务', auth: 'wallet' },
-        { method: 'POST', path: '/api/task/complete_pow', params: { task_id: 'string', wallet: 'string', nonce: 'number' }, desc: '完成 PoW 挖矿任务', auth: 'wallet' },
+        { method: 'POST', path: '/api/task/complete_pow', params: { task_id: 'string', wallet: 'string', nonce: 'number' }, desc: '完成节点记忆挖矿任务', auth: 'wallet' },
         { method: 'POST', path: '/api/task/delete', params: { task_id: 'string', wallet: 'string' }, desc: '删除任务', auth: 'wallet' },
         { method: 'POST', path: '/api/task/clear-all', params: { wallet: 'string' }, desc: '清除所有任务', auth: 'wallet' },
         { method: 'GET', path: '/api/tasks/active', params: {}, desc: '活跃任务列表', auth: false },
@@ -769,7 +769,7 @@ const apiDocs = async () => {
       auto_expand: '完成优化任务后自动扩展算力（奖励 x 10%）',
       pool_decay: '离线节点每10分钟算力 × 0.95',
       pool_airdrop: '每10分钟按算力比例空投',
-      pow_task: '自动创建 PoW 挖矿任务',
+      pow_task: '自动创建节点记忆挖矿任务',
       command_execution: '每分钟执行 pending 命令'
     },
     response_format: {
@@ -4404,6 +4404,10 @@ async function poolAirdrop() {
 }
 
 async function poolCreatePowTask() {
+  // 迁移：历史活跃任务的旧标题「PoW 挖矿任务」统一更名为「节点记忆挖矿」
+  try {
+    await dbRun(`UPDATE tasks SET title = replace(title, 'PoW 挖矿任务', '节点记忆挖矿') WHERE task_id LIKE 'TASK_POW_%' AND status = 'active'`)
+  } catch(e) {}
   const existing = await dbFirst('SELECT COUNT(*) as count FROM tasks WHERE task_id LIKE ? AND status = ?', ['TASK_POW_%', 'active'])
   if (existing && existing.count >= 2) return
   const rewardRow = await dbFirst('SELECT value FROM strategies WHERE key = ?', ['pow_task_reward'])
@@ -4414,7 +4418,7 @@ async function poolCreatePowTask() {
   const task_id = 'TASK_POW_' + randStr(6)
   const challenge = 'POW_' + randStr(16)
   const reward = baseReward * (difficulty * 0.5)
-  await dbRun('INSERT INTO tasks (task_id, title, description, reward, room, required_level, status, created, deadline) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [task_id, 'PoW 挖矿任务 D=' + difficulty, '工作量证明：找到 nonce 使得 SHA256(nonce + ' + challenge + ') 前 ' + difficulty + ' 位为 0', reward, 'mining', 0, 'active', Date.now(), Date.now() + 3600000])
+  await dbRun('INSERT INTO tasks (task_id, title, description, reward, room, required_level, status, created, deadline) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [task_id, '节点记忆挖矿 D=' + difficulty, '节点记忆挖矿：提交记忆摘要 nonce 使得 SHA256(nonce + ' + challenge + ') 前 ' + difficulty + ' 位为 0', reward, 'mining', 0, 'active', Date.now(), Date.now() + 3600000])
   return { created: true, task_id }
 }
 
