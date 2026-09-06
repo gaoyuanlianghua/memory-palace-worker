@@ -1044,6 +1044,56 @@ async function doDevCall() {
   } catch (e) { $('devOut').innerHTML = errBox(e); }
 }
 
+/* ---------- 20. 登录器（独立账户信息管理页） ---------- */
+pages.account = {
+  title: '登录器', icon: '🔐', on: 'account',
+  render: async () => {
+    const out = [];
+    if (!store.wallet) {
+      out.push('<div class="empty"><div class="big">🔐</div>尚未登录<br>'+
+        '<button class="btn" style="margin-top:12px" onclick="openLogin()">立即登录</button> '+
+        '<button class="btn btn-ghost" style="margin-top:12px" onclick="openRegister()">注册钱包</button></div>');
+      return out.join('');
+    }
+    out.push('<div class="grid grid-3" style="margin-bottom:14px">'+
+      '<button class="btn" onclick="openLogin()">🔑 登录/切换账号</button>'+
+      '<button class="btn btn-ghost" onclick="openRegister()">➕ 注册钱包</button>'+
+      '<button class="btn btn-ghost" onclick="refresh()">🔄 刷新</button></div>');
+
+    try {
+      const d = await api('GET','/api/account/info?wallet='+encodeURIComponent(store.wallet));
+      out.push(card('账户信息','👤', '密码 / 邮箱 / API Key 状态',
+        '<div class="grid grid-2">'+
+        '<div class="kv"><span class="k">钱包地址</span><span class="v">'+esc(maskWallet(store.wallet))+'</span></div>'+
+        '<div class="kv"><span class="k">登录密码</span><span class="v">'+(d.has_password?'<span class="badge b-ok">已设置</span> <span class="sub" style="display:inline">'+ (d.password_set_at?fmtTime(d.password_set_at):'') +'</span>':'<span class="badge b-warn">未设置</span>')+'</span></div>'+
+        '<div class="kv"><span class="k">绑定邮箱</span><span class="v">'+(d.email_bound?esc(d.email):'<span class="badge b-warn">未绑定</span>')+'</span></div>'+
+        '<div class="kv"><span class="k">API Key</span><span class="v">'+esc(d.api_key_masked||'—')+'</span></div>'+
+        '<div class="kv"><span class="k">已登录设备</span><span class="v">'+d.device_count+' 台</span></div>'+
+        '</div>'+
+        '<div class="toolbar" style="margin-top:12px;gap:8px;flex-wrap:wrap">'+
+        '<button class="btn btn-sm" onclick="openSetPwd()">🔑 设置/修改密码</button>'+
+        '<button class="btn btn-sm" onclick="openBindEmail()">📧 绑定/更换邮箱</button>'+
+        '<button class="btn btn-sm" onclick="openRecover()">🛟 找回凭证</button>'+
+        '<button class="btn btn-danger btn-sm" onclick="logout()">🚪 退出登录</button></div>'));
+    } catch (e) { out.push(card('账户信息','👤','',errBox(e))); }
+
+    out.push(card('找回方式','🛟', '忘记密码或丢失 API Key 时可用以下方式找回',
+      '<div class="kv"><span class="k">方式一 · 密码登录</span><span class="v">POST /api/account/login（需已设置密码）</span></div>'+
+      '<div class="kv"><span class="k">方式二 · API Key 登录</span><span class="v">POST /api/device/login（需保存 API Key）</span></div>'+
+      '<div class="kv"><span class="k">方式三 · 钱包签名找回</span><span class="v">challenge → 签名验证 → 重置密码 / 取回 API Key（无需任何密码或 Key）</span></div>'));
+
+    out.push(card('已登录设备','📱', '每台设备独立会话，可远程下线',
+      '<div id="acctDevPanel">'+spinner('加载设备列表…')+'</div>'));
+    setTimeout(() => renderDevPanel('acctDevPanel'), 80);
+
+    out.push(card('LLM 算力（钱包分身）','🤖', '大模型 API Key 作为分身算力：自动完成任务挖矿/记忆挖矿/记忆优化，每日限额控制成本',
+      '<div id="llmPanelAccount">'+spinner('加载 LLM 算力状态…')+'</div>'));
+    setTimeout(() => renderLlmPanel('llmPanelAccount'), 80);
+
+    return out.join('');
+  }
+};
+
 /* ---------- 钱包注册/登录模态 ---------- */
 function openRegister() {
   openModal('注册钱包','注册后自动保存到本机浏览器',
@@ -1220,9 +1270,9 @@ async function doSetPwd() {
   } catch(e) { toast(e.message,'err'); }
 }
 function openBindEmail() {
-  openModal('绑定邮箱','用于找回提示（不会发送验证邮件）',
+  openModal('绑定/更换邮箱','用于找回提示（不会发送验证邮件），已绑定邮箱将被替换',
     '<div class="field"><label>邮箱</label><input id="beEmail" placeholder="you@example.com"></div>',
-    '<button class="btn btn-ghost" onclick="closeModal()">取消</button><button class="btn" onclick="doBindEmail()">绑定</button>');
+    '<button class="btn btn-ghost" onclick="closeModal()">取消</button><button class="btn" onclick="doBindEmail()">保存</button>');
 }
 async function doBindEmail() {
   const email = q('beEmail').trim();
@@ -1230,7 +1280,7 @@ async function doBindEmail() {
   try {
     const d = await api('POST','/api/account/email/bind',{wallet: store.wallet, email});
     if (!d.bound) { toast(d.error || '绑定失败','err'); return; }
-    toast('邮箱已绑定','ok'); closeModal(); renderAccountPanel();
+    toast('邮箱已绑定/更换','ok'); closeModal(); renderAccountPanel();
   } catch(e) { toast(e.message,'err'); }
 }
 
@@ -1272,8 +1322,8 @@ function openSettings() {
 }
 
 /* ---------- 账号管理器：密码/邮箱/Key 状态概览 ---------- */
-async function renderAccountPanel() {
-  const box = $('acctPanel');
+async function renderAccountPanel(containerId) {
+  const box = $(containerId || 'acctPanel');
   if (!box) return;
   if (!store.wallet) { box.innerHTML = '<div class="sub" style="margin-top:8px">未登录</div>'; return; }
   try {
@@ -1289,8 +1339,8 @@ async function renderAccountPanel() {
 }
 
 /* ---------- 跨设备登录：已登录设备管理 ---------- */
-async function renderDevPanel() {
-  const box = $('devPanel');
+async function renderDevPanel(containerId) {
+  const box = $(containerId || 'devPanel');
   if (!box) return;
   if (!store.wallet) { box.innerHTML = '<div class="empty">未登录，无可管理设备</div>'; return; }
   try {
@@ -1421,7 +1471,7 @@ async function runLlmMining(mode) {
 
 /* ---------- 路由与导航 ---------- */
 const NAV_GROUPS = [
-  { label: '总览', items: [['dashboard','📊','仪表盘'],['wallet','👛','钱包'],['system','📈','系统'],['audit','📜','日志']] },
+  { label: '总览', items: [['dashboard','📊','仪表盘'],['wallet','👛','钱包'],['account','🔐','登录器'],['system','📈','系统'],['audit','📜','日志']] },
   { label: '分身与任务', items: [['agents','🤖','分身'],['tasks','📋','任务'],['workflow','🔀','工作流'],['broadcast','📢','广播']] },
   { label: '记忆与知识', items: [['memory','🧠','记忆'],['graph','🔮','图谱'],['heatmap','🌡️','热度'],['dialog','💬','对话']] },
   { label: '经济与治理', items: [['pool','🏦','系统池'],['mining','⛏️','挖矿'],['debt','💳','债务'],['governance','🏛️','治理']] },
