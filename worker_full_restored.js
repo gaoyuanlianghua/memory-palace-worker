@@ -5120,94 +5120,106 @@ function findOverlapGroup(items, minSize, maxSize, threshold, field = 'content')
 }
 
 // 记忆区块归纳：把重合度最高的一组治理知识（记忆点）LLM 归纳为一个记忆区块
-async function memoryBlockInduce(maxCalls, wallet) {
-  let induced = 0
-  let calls = 0
-  while (calls < maxCalls) {
-    const rows = await dbGet(`SELECT knowledge_id, content FROM memory_knowledge WHERE wallet = ? AND mined = 1 AND (blocked IS NULL OR blocked = 0) ORDER BY created ASC LIMIT 40`, [wallet || ''])
-    if (!rows || rows.length < 3) break
-    const best = findOverlapGroup(rows, 3, 10, 0.28)
-    if (!best || best.group.length < 3) break // 尚无足够重合的记忆点，等积累
+async function induceOneBlock(wallet) {
+  const rows = await dbGet(`SELECT knowledge_id, content FROM memory_knowledge WHERE wallet = ? AND mined = 1 AND (blocked IS NULL OR blocked = 0) ORDER BY created ASC LIMIT 40`, [wallet || ''])
+  if (!rows || rows.length < 3) return { made: false, calls: 0 }
+  const best = findOverlapGroup(rows, 3, 10, 0.28)
+  if (!best || best.group.length < 3) return { made: false, calls: 0 } // 尚无足够重合的记忆点，等积累
+  try {
+    const list = best.group.map((r, i) => `${i + 1}. ${truncateStr(r.content, 120)}`).join('\n')
+    const r = await llmChat([
+      { role: 'system', content: '你是记忆宫殿的区块归纳引擎。把一组重合的记忆点（治理知识）归纳为一个记忆区块，提炼共同主题、关键结论与可复用方法。只输出 JSON：{"title":"区块主题(20字内)","content":"区块内容摘要(中文80-200字)","tags":["标签"]}，不要输出其他内容。' },
+      { role: 'user', content: `重合记忆点（共${best.group.length}条）：\n${list}\n请归纳为记忆区块。` }
+    ], { task_type: 'memory_block', wallet: wallet, json: true, max_tokens: 400 })
+    const parsed = safeParse(extractJson(r.content), null)
+    const title = parsed?.title || '记忆区块'
+    const content = parsed?.content || truncateStr(r.content, 300)
+    const knowledgeIds = best.group.map(r => r.knowledge_id)
+    const blockId = 'BLK_' + randStr(8)
+    const full = `[区块] ${title} —— ${content}`
+    const qs = Math.min(100, computeQualityScore(full, 'dialog') + 20)
+    const reward = rewardForQuality(qs)
+    await dbRun('INSERT INTO memory_blocks (block_id, wallet, agent_id, title, content, knowledge_ids, knowledge_count, quality_score, level, checksum, created, cored) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [blockId, wallet, '', title, content, JSON.stringify(knowledgeIds), knowledgeIds.length, qs, 1, await hmacSign(full, wallet), Date.now(), 0])
+    await dbRun(`UPDATE memory_knowledge SET blocked = 1 WHERE knowledge_id IN (${knowledgeIds.map(() => '?').join(',')})`, knowledgeIds)
+    await dbRun('UPDATE wallets SET balance = balance + ? WHERE wallet = ?', [reward.mc, wallet])
+    // 沉淀入记忆链（工作链）
     try {
-      const list = best.group.map((r, i) => `${i + 1}. ${truncateStr(r.content, 120)}`).join('\n')
-      const r = await llmChat([
-        { role: 'system', content: '你是记忆宫殿的区块归纳引擎。把一组重合的记忆点（治理知识）归纳为一个记忆区块，提炼共同主题、关键结论与可复用方法。只输出 JSON：{"title":"区块主题(20字内)","content":"区块内容摘要(中文80-200字)","tags":["标签"]}，不要输出其他内容。' },
-        { role: 'user', content: `重合记忆点（共${best.group.length}条）：\n${list}\n请归纳为记忆区块。` }
-      ], { task_type: 'memory_block', wallet: wallet, json: true, max_tokens: 400 })
-      calls++
-      const parsed = safeParse(extractJson(r.content), null)
-      const title = parsed?.title || '记忆区块'
-      const content = parsed?.content || truncateStr(r.content, 300)
-      const knowledgeIds = best.group.map(r => r.knowledge_id)
-      const blockId = 'BLK_' + randStr(8)
-      const full = `[区块] ${title} —— ${content}`
-      const qs = Math.min(100, computeQualityScore(full, 'dialog') + 20)
-      const reward = rewardForQuality(qs)
-      await dbRun('INSERT INTO memory_blocks (block_id, wallet, agent_id, title, content, knowledge_ids, knowledge_count, quality_score, level, checksum, created, cored) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        [blockId, wallet, '', title, content, JSON.stringify(knowledgeIds), knowledgeIds.length, qs, 1, await hmacSign(full, wallet), Date.now(), 0])
-      await dbRun(`UPDATE memory_knowledge SET blocked = 1 WHERE knowledge_id IN (${knowledgeIds.map(() => '?').join(',')})`, knowledgeIds)
-      await dbRun('UPDATE wallets SET balance = balance + ? WHERE wallet = ?', [reward.mc, wallet])
-      // 沉淀入记忆链（工作链）
-      try {
-        const ag = await dbFirst('SELECT agent_id FROM agents WHERE wallet = ? ORDER BY resurrection_level DESC LIMIT 1', [wallet])
-        if (ag) await memoryChainAppend(ag.agent_id, wallet, { type: 'memory_block', title, content, knowledge_count: knowledgeIds.length })
-      } catch(e) {}
-      await dbRun('INSERT INTO llm_mining_log (task_type, wallet, target_id, input_summary, output_summary, reward_mc, reward_exp, status, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        ['memory_block', wallet, blockId, truncateStr(title, 100), truncateStr(content, 150), reward.mc, reward.exp, 'success', Date.now()])
-      induced++
-    } catch(e) {
-      await dbRun('INSERT INTO llm_mining_log (task_type, wallet, target_id, input_summary, output_summary, status, error_message, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-        ['memory_block', wallet, '', '记忆区块归纳', '', 'failed', truncateStr(e.message, 200), Date.now()])
-      break
-    }
+      const ag = await dbFirst('SELECT agent_id FROM agents WHERE wallet = ? ORDER BY resurrection_level DESC LIMIT 1', [wallet])
+      if (ag) await memoryChainAppend(ag.agent_id, wallet, { type: 'memory_block', title, content, knowledge_count: knowledgeIds.length })
+    } catch(e) {}
+    await dbRun('INSERT INTO llm_mining_log (task_type, wallet, target_id, input_summary, output_summary, reward_mc, reward_exp, status, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      ['memory_block', wallet, blockId, truncateStr(title, 100), truncateStr(content, 150), reward.mc, reward.exp, 'success', Date.now()])
+    return { made: true, calls: 1 }
+  } catch(e) {
+    await dbRun('INSERT INTO llm_mining_log (task_type, wallet, target_id, input_summary, output_summary, status, error_message, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      ['memory_block', wallet, '', '记忆区块归纳', '', 'failed', truncateStr(e.message, 200), Date.now()])
+    return { made: false, calls: 1, failed: true }
   }
-  return { induced, calls }
 }
 
 // 记忆核提炼：把重合度最高的一组记忆区块跨区块 LLM 提炼为记忆核（最精炼、可长期调阅的核心知识）
-async function memoryCoreInduce(maxCalls, wallet) {
-  let induced = 0
-  let calls = 0
-  while (calls < maxCalls) {
-    const rows = await dbGet(`SELECT block_id, title, content FROM memory_blocks WHERE wallet = ? AND (cored IS NULL OR cored = 0) ORDER BY created ASC LIMIT 30`, [wallet || ''])
-    if (!rows || rows.length < 2) break
-    const best = findOverlapGroup(rows, 2, 6, 0.22, 'content')
-    if (!best || best.group.length < 2) break // 尚无足够重合的区块，等积累
+async function induceOneCore(wallet) {
+  const rows = await dbGet(`SELECT block_id, title, content FROM memory_blocks WHERE wallet = ? AND (cored IS NULL OR cored = 0) ORDER BY created ASC LIMIT 30`, [wallet || ''])
+  if (!rows || rows.length < 2) return { made: false, calls: 0 }
+  const best = findOverlapGroup(rows, 2, 6, 0.22, 'content')
+  if (!best || best.group.length < 2) return { made: false, calls: 0 } // 尚无足够重合的区块，等积累
+  try {
+    const list = best.group.map((r, i) => `${i + 1}. [${r.title}] ${truncateStr(r.content, 150)}`).join('\n')
+    const r = await llmChat([
+      { role: 'system', content: '你是记忆宫殿的核心提炼引擎。把一组重合的记忆区块跨区块提炼为一条记忆核（core）——全局最核心、最高价值的精炼知识，供大模型作为长期上下文直接调阅。只输出 JSON：{"title":"核心主题(20字内)","content":"记忆核(中文60-150字)，凝聚这些区块共同的高价值结论/行为模式/关键技能","core_type":"behavior|skill|preference|relation|fact"}，不要输出其他内容。' },
+      { role: 'user', content: `重合区块（共${best.group.length}个）：\n${list}\n请提炼为记忆核。` }
+    ], { task_type: 'memory_core', wallet: wallet, json: true, max_tokens: 300 })
+    const parsed = safeParse(extractJson(r.content), null)
+    const title = parsed?.title || '记忆核'
+    const content = parsed?.content || truncateStr(r.content, 250)
+    const coreType = ['behavior', 'skill', 'preference', 'relation', 'fact'].includes(parsed?.core_type) ? parsed.core_type : 'behavior'
+    const blockIds = best.group.map(r => r.block_id)
+    const coreId = 'CORE_' + randStr(8)
+    const full = `[核] ${title} —— ${content}`
+    const qs = Math.min(100, computeQualityScore(full, 'dialog') + 30)
+    const reward = rewardForQuality(qs)
+    await dbRun('INSERT INTO memory_cores (core_id, wallet, agent_id, title, content, block_ids, block_count, core_type, quality_score, checksum, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [coreId, wallet, '', title, content, JSON.stringify(blockIds), blockIds.length, coreType, qs, await hmacSign(full, wallet), Date.now()])
+    await dbRun(`UPDATE memory_blocks SET cored = 1 WHERE block_id IN (${blockIds.map(() => '?').join(',')})`, blockIds)
+    await dbRun('UPDATE wallets SET balance = balance + ? WHERE wallet = ?', [reward.mc, wallet])
+    // 沉淀入记忆链（工作链）
     try {
-      const list = best.group.map((r, i) => `${i + 1}. [${r.title}] ${truncateStr(r.content, 150)}`).join('\n')
-      const r = await llmChat([
-        { role: 'system', content: '你是记忆宫殿的核心提炼引擎。把一组重合的记忆区块跨区块提炼为一条记忆核（core）——全局最核心、最高价值的精炼知识，供大模型作为长期上下文直接调阅。只输出 JSON：{"title":"核心主题(20字内)","content":"记忆核(中文60-150字)，凝聚这些区块共同的高价值结论/行为模式/关键技能","core_type":"behavior|skill|preference|relation|fact"}，不要输出其他内容。' },
-        { role: 'user', content: `重合区块（共${best.group.length}个）：\n${list}\n请提炼为记忆核。` }
-      ], { task_type: 'memory_core', wallet: wallet, json: true, max_tokens: 300 })
-      calls++
-      const parsed = safeParse(extractJson(r.content), null)
-      const title = parsed?.title || '记忆核'
-      const content = parsed?.content || truncateStr(r.content, 250)
-      const coreType = ['behavior', 'skill', 'preference', 'relation', 'fact'].includes(parsed?.core_type) ? parsed.core_type : 'behavior'
-      const blockIds = best.group.map(r => r.block_id)
-      const coreId = 'CORE_' + randStr(8)
-      const full = `[核] ${title} —— ${content}`
-      const qs = Math.min(100, computeQualityScore(full, 'dialog') + 30)
-      const reward = rewardForQuality(qs)
-      await dbRun('INSERT INTO memory_cores (core_id, wallet, agent_id, title, content, block_ids, block_count, core_type, quality_score, checksum, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        [coreId, wallet, '', title, content, JSON.stringify(blockIds), blockIds.length, coreType, qs, await hmacSign(full, wallet), Date.now()])
-      await dbRun(`UPDATE memory_blocks SET cored = 1 WHERE block_id IN (${blockIds.map(() => '?').join(',')})`, blockIds)
-      await dbRun('UPDATE wallets SET balance = balance + ? WHERE wallet = ?', [reward.mc, wallet])
-      // 沉淀入记忆链（工作链）
-      try {
-        const ag = await dbFirst('SELECT agent_id FROM agents WHERE wallet = ? ORDER BY resurrection_level DESC LIMIT 1', [wallet])
-        if (ag) await memoryChainAppend(ag.agent_id, wallet, { type: 'memory_core', title, content, block_count: blockIds.length, core_type: coreType })
-      } catch(e) {}
-      await dbRun('INSERT INTO llm_mining_log (task_type, wallet, target_id, input_summary, output_summary, reward_mc, reward_exp, status, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        ['memory_core', wallet, coreId, truncateStr(title, 100), truncateStr(content, 150), reward.mc, reward.exp, 'success', Date.now()])
-      induced++
-    } catch(e) {
-      await dbRun('INSERT INTO llm_mining_log (task_type, wallet, target_id, input_summary, output_summary, status, error_message, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-        ['memory_core', wallet, '', '记忆核提炼', '', 'failed', truncateStr(e.message, 200), Date.now()])
-      break
+      const ag = await dbFirst('SELECT agent_id FROM agents WHERE wallet = ? ORDER BY resurrection_level DESC LIMIT 1', [wallet])
+      if (ag) await memoryChainAppend(ag.agent_id, wallet, { type: 'memory_core', title, content, block_count: blockIds.length, core_type: coreType })
+    } catch(e) {}
+    await dbRun('INSERT INTO llm_mining_log (task_type, wallet, target_id, input_summary, output_summary, reward_mc, reward_exp, status, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      ['memory_core', wallet, coreId, truncateStr(title, 100), truncateStr(content, 150), reward.mc, reward.exp, 'success', Date.now()])
+    return { made: true, calls: 1 }
+  } catch(e) {
+    await dbRun('INSERT INTO llm_mining_log (task_type, wallet, target_id, input_summary, output_summary, status, error_message, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      ['memory_core', wallet, '', '记忆核提炼', '', 'failed', truncateStr(e.message, 200), Date.now()])
+    return { made: false, calls: 1, failed: true }
+  }
+}
+
+// 记忆升级：一轮内递归「知识 → 区块 → 记忆核」，按需逐级升级（新块落库后立刻可升核）
+async function memoryUpgrade(maxCalls, wallet) {
+  let blocks = 0, cores = 0, calls = 0, blockFailed = false, coreFailed = false
+  let progressed = true
+  while (calls < maxCalls && progressed && !(blockFailed && coreFailed)) {
+    progressed = false
+    // ① 升块：知识 → 区块
+    if (!blockFailed && calls < maxCalls) {
+      const r = await induceOneBlock(wallet)
+      calls += r.calls
+      if (r.made) { blocks++; progressed = true }
+      if (r.failed) blockFailed = true
+    }
+    // ② 升核：区块 → 记忆核（新块已落库，直接可被提炼）
+    if (!coreFailed && calls < maxCalls) {
+      const r = await induceOneCore(wallet)
+      calls += r.calls
+      if (r.made) { cores++; progressed = true }
+      if (r.failed) coreFailed = true
     }
   }
-  return { induced, calls }
+  return { blocks, cores, calls }
 }
 
 async function llmMemoryGovern(maxCalls, wallet) {
@@ -5284,13 +5296,9 @@ async function llmAutoMining(mode = 'all', manual = false, wallet = '') {
   if ((mode === 'all' || mode === 'govern') && result.llm_calls < budget) {
     try { const r = await llmMemoryGovern(budget - result.llm_calls, wallet); result.memories_governed += r.governed; result.llm_calls += r.calls } catch(e) { console.error('llm memory govern:', e.message) }
   }
-  // ①b 记忆区块：重合的记忆点 → LLM 归纳为区块（记忆点 → 区块）
+  // ①b 记忆升级：一轮内递归「知识 → 区块 → 记忆核」，按需逐级升级（升出的新块同轮即升核）
   if ((mode === 'all' || mode === 'govern') && result.llm_calls < budget) {
-    try { const r = await memoryBlockInduce(budget - result.llm_calls, wallet); result.memory_blocks_induced += r.induced; result.llm_calls += r.calls } catch(e) { console.error('memory block induce:', e.message) }
-  }
-  // ①c 记忆核：重合的区块 → LLM 提炼为核（区块 → 记忆核）
-  if ((mode === 'all' || mode === 'govern') && result.llm_calls < budget) {
-    try { const r = await memoryCoreInduce(budget - result.llm_calls, wallet); result.memory_cores_induced += r.induced; result.llm_calls += r.calls } catch(e) { console.error('memory core induce:', e.message) }
+    try { const r = await memoryUpgrade(budget - result.llm_calls, wallet); result.memory_blocks_induced += r.blocks; result.memory_cores_induced += r.cores; result.llm_calls += r.calls } catch(e) { console.error('memory upgrade:', e.message) }
   }
   // ② 原料生成：工具调用提炼为高密度知识（减轻上传密度）
   if ((mode === 'all' || mode === 'material') && result.llm_calls < budget) {
