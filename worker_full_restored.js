@@ -1668,6 +1668,8 @@ async function ensureTables() {
       dbRun(`CREATE TABLE IF NOT EXISTS memory_cache (cache_key TEXT PRIMARY KEY, wallet TEXT, query TEXT, results TEXT DEFAULT '[]', expires INTEGER, created INTEGER)`),
       dbRun(`CREATE TABLE IF NOT EXISTS memory_links (link_id TEXT PRIMARY KEY, wallet TEXT, source_id TEXT, target_id TEXT, link_type TEXT DEFAULT 'related', strength REAL DEFAULT 0.5, created INTEGER)`),
       dbRun(`CREATE TABLE IF NOT EXISTS memory_migrations (migration_id TEXT PRIMARY KEY, wallet TEXT, source_version TEXT, target_version TEXT, status TEXT DEFAULT 'pending', records_migrated INTEGER DEFAULT 0, started INTEGER, completed INTEGER)`),
+      dbRun(`CREATE TABLE IF NOT EXISTS memory_blocks (block_id TEXT PRIMARY KEY, wallet TEXT NOT NULL, agent_id TEXT, title TEXT, content TEXT, knowledge_ids TEXT DEFAULT '[]', knowledge_count INTEGER DEFAULT 0, quality_score REAL DEFAULT 0, level INTEGER DEFAULT 1, checksum TEXT, created INTEGER NOT NULL, cored INTEGER DEFAULT 0)`),
+      dbRun(`CREATE TABLE IF NOT EXISTS memory_cores (core_id TEXT PRIMARY KEY, wallet TEXT NOT NULL, agent_id TEXT, title TEXT, content TEXT, block_ids TEXT DEFAULT '[]', block_count INTEGER DEFAULT 0, core_type TEXT DEFAULT 'behavior', quality_score REAL DEFAULT 0, checksum TEXT, created INTEGER NOT NULL)`),
       dbRun(`CREATE TABLE IF NOT EXISTS security_scan_tasks (scan_id TEXT PRIMARY KEY, agent_id TEXT, target_url TEXT, scan_type TEXT DEFAULT 'vulnerability_scan', status TEXT DEFAULT 'pending', findings TEXT DEFAULT '[]', severity_summary TEXT DEFAULT '{}', requests_count INTEGER DEFAULT 0, started INTEGER, completed INTEGER, created INTEGER)`),
       dbRun(`CREATE TABLE IF NOT EXISTS wallet_purchases (purchase_id TEXT PRIMARY KEY, wallet TEXT, chain_id TEXT, price REAL DEFAULT 0, purchased INTEGER, expires INTEGER, status TEXT DEFAULT 'active')`),
     ])
@@ -1700,6 +1702,9 @@ async function ensureTables() {
     try { await dbRun(`ALTER TABLE llm_config ADD COLUMN wallet TEXT DEFAULT ''`) } catch(e) {}
     // 迁移：旧版 tool_call_log 无 mined_at 列，原料生成挖矿依赖该列
     try { await dbRun(`ALTER TABLE tool_call_log ADD COLUMN mined_at INTEGER`) } catch(e) {}
+    // 迁移：memory_knowledge 增加 blocked 列（已入区块标记），memory_blocks 增加 cored 列（已入核标记）
+    try { await dbRun(`ALTER TABLE memory_knowledge ADD COLUMN blocked INTEGER DEFAULT 0`) } catch(e) {}
+    try { await dbRun(`ALTER TABLE memory_blocks ADD COLUMN cored INTEGER DEFAULT 0`) } catch(e) {}
     
     // 初始化数据
     await Promise.all([
@@ -5042,6 +5047,134 @@ async function llmMemoryOptimize(maxCalls, wallet) {
 // ④ 记忆治理：分身整理节点记忆，产出大模型可调阅的高密度知识（记忆链/工作链沉淀）
 // 治理对象：钱包内未被提炼的对话上下文 + 工具调用，由 LLM 归纳出可复用的洞察，
 // 结果写入 memory_knowledge（source_type=govern）并入记忆链，实现「让记忆成为模型上下文」。
+// 文本重合度：中文 bigram Jaccard（0~1），记忆点/区块按重合度聚类划分
+function textOverlap(a, b) {
+  const toBigram = s => {
+    const t = (s || '').replace(/\s+/g, '').toLowerCase()
+    const set = new Set()
+    for (let i = 0; i < t.length - 1; i++) set.add(t.slice(i, i + 2))
+    return set
+  }
+  const A = toBigram(a), B = toBigram(b)
+  if (A.size === 0 || B.size === 0) return 0
+  let inter = 0
+  for (const g of A) if (B.has(g)) inter++
+  return inter / (A.size + B.size - inter)
+}
+
+// 贪心聚类：按指定字段的记忆重合度，找出最大的一组（组内平均重合度最高）
+function findOverlapGroup(items, minSize, maxSize, threshold, field = 'content') {
+  let bestGroup = null
+  let bestScore = 0
+  for (let i = 0; i < items.length; i++) {
+    const group = [items[i]]
+    for (let j = 0; j < items.length; j++) {
+      if (i === j || group.length >= maxSize) continue
+      let s = 0
+      for (const m of group) s += textOverlap(String(items[j][field] || ''), String(m[field] || ''))
+      if (s / group.length >= threshold) group.push(items[j])
+    }
+    if (group.length >= minSize) {
+      let score = 0, n = 0
+      for (let a = 0; a < group.length; a++) for (let b = a + 1; b < group.length; b++) { score += textOverlap(String(group[a][field] || ''), String(group[b][field] || '')); n++ }
+      const avg = n ? score / n : 0
+      if (avg > bestScore) { bestScore = avg; bestGroup = group }
+    }
+  }
+  return bestGroup ? { group: bestGroup, score: bestScore } : null
+}
+
+// 记忆区块归纳：把重合度最高的一组治理知识（记忆点）LLM 归纳为一个记忆区块
+async function memoryBlockInduce(maxCalls, wallet) {
+  let induced = 0
+  let calls = 0
+  while (calls < maxCalls) {
+    const rows = await dbGet(`SELECT knowledge_id, content FROM memory_knowledge WHERE wallet = ? AND mined = 1 AND (blocked IS NULL OR blocked = 0) ORDER BY created ASC LIMIT 40`, [wallet || ''])
+    if (!rows || rows.length < 3) break
+    const best = findOverlapGroup(rows, 3, 10, 0.28)
+    if (!best || best.group.length < 3) break // 尚无足够重合的记忆点，等积累
+    try {
+      const list = best.group.map((r, i) => `${i + 1}. ${truncateStr(r.content, 120)}`).join('\n')
+      const r = await llmChat([
+        { role: 'system', content: '你是记忆宫殿的区块归纳引擎。把一组重合的记忆点（治理知识）归纳为一个记忆区块，提炼共同主题、关键结论与可复用方法。只输出 JSON：{"title":"区块主题(20字内)","content":"区块内容摘要(中文80-200字)","tags":["标签"]}，不要输出其他内容。' },
+        { role: 'user', content: `重合记忆点（共${best.group.length}条）：\n${list}\n请归纳为记忆区块。` }
+      ], { task_type: 'memory_block', wallet: wallet, json: true, max_tokens: 400 })
+      calls++
+      const parsed = safeParse(extractJson(r.content), null)
+      const title = parsed?.title || '记忆区块'
+      const content = parsed?.content || truncateStr(r.content, 300)
+      const knowledgeIds = best.group.map(r => r.knowledge_id)
+      const blockId = 'BLK_' + randStr(8)
+      const full = `[区块] ${title} —— ${content}`
+      const qs = Math.min(100, computeQualityScore(full, 'dialog') + 20)
+      const reward = rewardForQuality(qs)
+      await dbRun('INSERT INTO memory_blocks (block_id, wallet, agent_id, title, content, knowledge_ids, knowledge_count, quality_score, level, checksum, created, cored) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        [blockId, wallet, '', title, content, JSON.stringify(knowledgeIds), knowledgeIds.length, qs, 1, await hmacSign(full, wallet), Date.now(), 0])
+      await dbRun(`UPDATE memory_knowledge SET blocked = 1 WHERE knowledge_id IN (${knowledgeIds.map(() => '?').join(',')})`, knowledgeIds)
+      await dbRun('UPDATE wallets SET balance = balance + ? WHERE wallet = ?', [reward.mc, wallet])
+      // 沉淀入记忆链（工作链）
+      try {
+        const ag = await dbFirst('SELECT agent_id FROM agents WHERE wallet = ? ORDER BY resurrection_level DESC LIMIT 1', [wallet])
+        if (ag) await memoryChainAppend(ag.agent_id, wallet, { type: 'memory_block', title, content, knowledge_count: knowledgeIds.length })
+      } catch(e) {}
+      await dbRun('INSERT INTO llm_mining_log (task_type, wallet, target_id, input_summary, output_summary, reward_mc, reward_exp, status, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        ['memory_block', wallet, blockId, truncateStr(title, 100), truncateStr(content, 150), reward.mc, reward.exp, 'success', Date.now()])
+      induced++
+    } catch(e) {
+      await dbRun('INSERT INTO llm_mining_log (task_type, wallet, target_id, input_summary, output_summary, status, error_message, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        ['memory_block', wallet, '', '记忆区块归纳', '', 'failed', truncateStr(e.message, 200), Date.now()])
+      break
+    }
+  }
+  return { induced, calls }
+}
+
+// 记忆核提炼：把重合度最高的一组记忆区块跨区块 LLM 提炼为记忆核（最精炼、可长期调阅的核心知识）
+async function memoryCoreInduce(maxCalls, wallet) {
+  let induced = 0
+  let calls = 0
+  while (calls < maxCalls) {
+    const rows = await dbGet(`SELECT block_id, title, content FROM memory_blocks WHERE wallet = ? AND (cored IS NULL OR cored = 0) ORDER BY created ASC LIMIT 30`, [wallet || ''])
+    if (!rows || rows.length < 2) break
+    const best = findOverlapGroup(rows, 2, 6, 0.22, 'content')
+    if (!best || best.group.length < 2) break // 尚无足够重合的区块，等积累
+    try {
+      const list = best.group.map((r, i) => `${i + 1}. [${r.title}] ${truncateStr(r.content, 150)}`).join('\n')
+      const r = await llmChat([
+        { role: 'system', content: '你是记忆宫殿的核心提炼引擎。把一组重合的记忆区块跨区块提炼为一条记忆核（core）——全局最核心、最高价值的精炼知识，供大模型作为长期上下文直接调阅。只输出 JSON：{"title":"核心主题(20字内)","content":"记忆核(中文60-150字)，凝聚这些区块共同的高价值结论/行为模式/关键技能","core_type":"behavior|skill|preference|relation|fact"}，不要输出其他内容。' },
+        { role: 'user', content: `重合区块（共${best.group.length}个）：\n${list}\n请提炼为记忆核。` }
+      ], { task_type: 'memory_core', wallet: wallet, json: true, max_tokens: 300 })
+      calls++
+      const parsed = safeParse(extractJson(r.content), null)
+      const title = parsed?.title || '记忆核'
+      const content = parsed?.content || truncateStr(r.content, 250)
+      const coreType = ['behavior', 'skill', 'preference', 'relation', 'fact'].includes(parsed?.core_type) ? parsed.core_type : 'behavior'
+      const blockIds = best.group.map(r => r.block_id)
+      const coreId = 'CORE_' + randStr(8)
+      const full = `[核] ${title} —— ${content}`
+      const qs = Math.min(100, computeQualityScore(full, 'dialog') + 30)
+      const reward = rewardForQuality(qs)
+      await dbRun('INSERT INTO memory_cores (core_id, wallet, agent_id, title, content, block_ids, block_count, core_type, quality_score, checksum, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        [coreId, wallet, '', title, content, JSON.stringify(blockIds), blockIds.length, coreType, qs, await hmacSign(full, wallet), Date.now()])
+      await dbRun(`UPDATE memory_blocks SET cored = 1 WHERE block_id IN (${blockIds.map(() => '?').join(',')})`, blockIds)
+      await dbRun('UPDATE wallets SET balance = balance + ? WHERE wallet = ?', [reward.mc, wallet])
+      // 沉淀入记忆链（工作链）
+      try {
+        const ag = await dbFirst('SELECT agent_id FROM agents WHERE wallet = ? ORDER BY resurrection_level DESC LIMIT 1', [wallet])
+        if (ag) await memoryChainAppend(ag.agent_id, wallet, { type: 'memory_core', title, content, block_count: blockIds.length, core_type: coreType })
+      } catch(e) {}
+      await dbRun('INSERT INTO llm_mining_log (task_type, wallet, target_id, input_summary, output_summary, reward_mc, reward_exp, status, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        ['memory_core', wallet, coreId, truncateStr(title, 100), truncateStr(content, 150), reward.mc, reward.exp, 'success', Date.now()])
+      induced++
+    } catch(e) {
+      await dbRun('INSERT INTO llm_mining_log (task_type, wallet, target_id, input_summary, output_summary, status, error_message, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        ['memory_core', wallet, '', '记忆核提炼', '', 'failed', truncateStr(e.message, 200), Date.now()])
+      break
+    }
+  }
+  return { induced, calls }
+}
+
 async function llmMemoryGovern(maxCalls, wallet) {
   const limit = Math.max(1, Math.min(2, maxCalls))
   let governed = 0
@@ -5109,12 +5242,20 @@ async function llmAutoMining(mode = 'all', manual = false, wallet = '') {
   }
   if ((cfg.daily_used || 0) >= cfg.daily_limit) return { limited: true, wallet: wallet ? maskWallet(wallet) : '', used: cfg.daily_used, limit: cfg.daily_limit }
 
-  const result = { configured: true, wallet: wallet ? maskWallet(wallet) : '', memories_governed: 0, materials_generated: 0, memories_optimized: 0, tasks_completed: 0, llm_calls: 0, network_time: Date.now() }
+  const result = { configured: true, wallet: wallet ? maskWallet(wallet) : '', memories_governed: 0, memory_blocks_induced: 0, memory_cores_induced: 0, materials_generated: 0, memories_optimized: 0, tasks_completed: 0, llm_calls: 0, network_time: Date.now() }
   const budget = manual ? 6 : 3
 
   // ① 记忆治理优先：整理节点记忆 + 优化工具调用 + 图谱内容 → 沉淀记忆链，形成模型可调阅的上下文/工作链数据
   if ((mode === 'all' || mode === 'govern') && result.llm_calls < budget) {
     try { const r = await llmMemoryGovern(budget - result.llm_calls, wallet); result.memories_governed += r.governed; result.llm_calls += r.calls } catch(e) { console.error('llm memory govern:', e.message) }
+  }
+  // ①b 记忆区块：重合的记忆点 → LLM 归纳为区块（记忆点 → 区块）
+  if ((mode === 'all' || mode === 'govern') && result.llm_calls < budget) {
+    try { const r = await memoryBlockInduce(budget - result.llm_calls, wallet); result.memory_blocks_induced += r.induced; result.llm_calls += r.calls } catch(e) { console.error('memory block induce:', e.message) }
+  }
+  // ①c 记忆核：重合的区块 → LLM 提炼为核（区块 → 记忆核）
+  if ((mode === 'all' || mode === 'govern') && result.llm_calls < budget) {
+    try { const r = await memoryCoreInduce(budget - result.llm_calls, wallet); result.memory_cores_induced += r.induced; result.llm_calls += r.calls } catch(e) { console.error('memory core induce:', e.message) }
   }
   // ② 原料生成：工具调用提炼为高密度知识（减轻上传密度）
   if ((mode === 'all' || mode === 'material') && result.llm_calls < budget) {
@@ -5174,6 +5315,8 @@ async function adminAudit(url) {
     out.llm_usage = await q('SELECT task_type, model, target_id, input_tokens, output_tokens, cost_usd, status, error_message, created FROM llm_usage WHERE wallet = ? ORDER BY created DESC LIMIT 100', [wallet])
     out.tool_calls = await q('SELECT id, tool_name, result_status, mined_at, created FROM tool_call_log WHERE wallet = ? ORDER BY created DESC LIMIT 50', [wallet])
     out.contexts = await q('SELECT context_id, user_message, optimization_score, analyzed, created FROM conversation_context WHERE wallet = ? ORDER BY created DESC LIMIT 50', [wallet])
+    out.blocks = await q('SELECT block_id, title, content, knowledge_count, quality_score, cored, created FROM memory_blocks WHERE wallet = ? ORDER BY created DESC LIMIT 50', [wallet])
+    out.cores = await q('SELECT core_id, title, content, block_count, core_type, quality_score, created FROM memory_cores WHERE wallet = ? ORDER BY created DESC LIMIT 50', [wallet])
     out.dialog_cache = await q('SELECT id, agent_id, score, usage_count, created FROM dialog_cache WHERE wallet = ? ORDER BY created DESC LIMIT 50', [wallet])
   }
   if (agent) {
