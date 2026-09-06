@@ -1705,6 +1705,28 @@ async function ensureTables() {
     // 迁移：memory_knowledge 增加 blocked 列（已入区块标记），memory_blocks 增加 cored 列（已入核标记）
     try { await dbRun(`ALTER TABLE memory_knowledge ADD COLUMN blocked INTEGER DEFAULT 0`) } catch(e) {}
     try { await dbRun(`ALTER TABLE memory_blocks ADD COLUMN cored INTEGER DEFAULT 0`) } catch(e) {}
+    // 迁移：兼容线上旧结构 memory_blocks / memory_cores 表（缺 wallet 等列，可能由旧版本/外部部署创建）
+    try { await dbRun(`ALTER TABLE memory_blocks ADD COLUMN wallet TEXT`) } catch(e) {}
+    try { await dbRun(`ALTER TABLE memory_blocks ADD COLUMN agent_id TEXT`) } catch(e) {}
+    try { await dbRun(`ALTER TABLE memory_blocks ADD COLUMN knowledge_ids TEXT DEFAULT '[]'`) } catch(e) {}
+    try { await dbRun(`ALTER TABLE memory_blocks ADD COLUMN knowledge_count INTEGER DEFAULT 0`) } catch(e) {}
+    try { await dbRun(`ALTER TABLE memory_blocks ADD COLUMN quality_score REAL DEFAULT 0`) } catch(e) {}
+    try { await dbRun(`ALTER TABLE memory_blocks ADD COLUMN level INTEGER DEFAULT 1`) } catch(e) {}
+    try { await dbRun(`ALTER TABLE memory_blocks ADD COLUMN checksum TEXT`) } catch(e) {}
+    try { await dbRun(`ALTER TABLE memory_blocks ADD COLUMN created INTEGER DEFAULT 0`) } catch(e) {}
+    try { await dbRun(`ALTER TABLE memory_cores ADD COLUMN wallet TEXT`) } catch(e) {}
+    try { await dbRun(`ALTER TABLE memory_cores ADD COLUMN agent_id TEXT`) } catch(e) {}
+    try { await dbRun(`ALTER TABLE memory_cores ADD COLUMN block_ids TEXT DEFAULT '[]'`) } catch(e) {}
+    try { await dbRun(`ALTER TABLE memory_cores ADD COLUMN block_count INTEGER DEFAULT 0`) } catch(e) {}
+    try { await dbRun(`ALTER TABLE memory_cores ADD COLUMN core_type TEXT DEFAULT 'behavior'`) } catch(e) {}
+    try { await dbRun(`ALTER TABLE memory_cores ADD COLUMN quality_score REAL DEFAULT 0`) } catch(e) {}
+    try { await dbRun(`ALTER TABLE memory_cores ADD COLUMN checksum TEXT`) } catch(e) {}
+    try { await dbRun(`ALTER TABLE memory_cores ADD COLUMN created INTEGER DEFAULT 0`) } catch(e) {}
+    // 迁移：历史区块/核归属钱包（经 agent_id 反查），查不到的归 ''（全局）
+    try { await dbRun(`UPDATE memory_blocks SET wallet = (SELECT w.wallet FROM agents w WHERE w.agent_id = memory_blocks.agent_id) WHERE wallet IS NULL`) } catch(e) {}
+    try { await dbRun(`UPDATE memory_blocks SET wallet = '' WHERE wallet IS NULL`) } catch(e) {}
+    try { await dbRun(`UPDATE memory_cores SET wallet = (SELECT w.wallet FROM agents w WHERE w.agent_id = memory_cores.agent_id) WHERE wallet IS NULL`) } catch(e) {}
+    try { await dbRun(`UPDATE memory_cores SET wallet = '' WHERE wallet IS NULL`) } catch(e) {}
     
     // 初始化数据
     await Promise.all([
