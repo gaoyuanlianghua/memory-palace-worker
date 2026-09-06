@@ -1,0 +1,81 @@
+# ============================================================
+# 记忆宫殿 · GitHub Actions 部署示例
+# 功能：构建 memory-palace 前端，并将 VITE_API_ORIGINS
+#        （仓库 Variables）注入 console.html，部署到 Cloudflare Pages
+# 用法：将本文件放到仓库 .github/workflows/ 下（如 deploy-console.yml）
+# 前置：在仓库 Settings → Secrets and variables → Actions → Variables
+#       中新建变量  VITE_API_ORIGINS = https://域名1,https://域名2
+# ============================================================
+name: Deploy Console to Cloudflare Pages
+
+on:
+  push:
+    branches: [main, master, frontend]
+  workflow_dispatch: {} # 支持手动触发
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      deployments: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: memory-palace/package-lock.json
+
+      - name: Install Dependencies
+        working-directory: ./memory-palace
+        run: npm ci
+
+      # ----------------------------------------------------------
+      # 关键步骤：构建时注入多端点列表
+      #   VITE_API_ORIGINS 来自仓库 Variables（${{ vars.xxx }}）
+      #   逗号分隔；留空 = 同源模式
+      #   vite.config.ts 的 injectApiOrigins 插件会在构建时
+      #   把该值写入 dist/console.html 的 BUILTIN_ORIGINS
+      # ----------------------------------------------------------
+      - name: Build
+        working-directory: ./memory-palace
+        run: npm run build
+        env:
+          VITE_API_BASE: /api
+          VITE_API_ORIGINS: ${{ vars.VITE_API_ORIGINS }}
+
+      # ----------------------------------------------------------
+      # 部署到 Cloudflare Pages（public/console.html 会自动随 dist 发布）
+      # ----------------------------------------------------------
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/pages-action@v1
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          projectName: gyuanpalace-xyz
+          directory: memory-palace/dist
+          gitHubToken: ${{ secrets.GITHUB_TOKEN }}
+          wranglerVersion: '3'
+
+  # ============================================================
+  # 可选：部署后自动验证 console.html 是否已注入端点
+  # ============================================================
+  verify:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify injected origins
+        run: |
+          echo "部署完成后访问 https://<你的Pages域名>/console.html"
+          echo "顶栏应显示「就近节点 xxx ms」；若显示「同源模式」请检查 Variables"
+
+  # ============================================================
+  # 注入值示例（在仓库 Variables 中配置，不要写死在文件里）：
+  #   VITE_API_ORIGINS=https://gyuanpalace.xyz,https://lingdayun.cn
+  #   留空 → 同源模式
+  # ============================================================

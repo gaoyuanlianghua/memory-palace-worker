@@ -33,6 +33,8 @@ jobs:
         run: npm run build
         env:
           VITE_API_BASE: /api
+          # 多端点候选（逗号分隔，留空 = 同源）。配置仓库 Variables: VITE_API_ORIGINS
+          VITE_API_ORIGINS: ${{ vars.VITE_API_ORIGINS }}
 
       - name: Deploy to Cloudflare Pages
         uses: cloudflare/pages-action@v1
