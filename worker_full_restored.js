@@ -442,10 +442,14 @@ export default {
       await poolCreatePowTask()
     } catch(e) {}
     
-    // 8. LLM 自动挖矿（钱包分身算力接口：完成任务/生成原料/记忆优化，每日限额）
+    // 8. LLM 自动挖矿（钱包分身算力接口：完成任务/生成原料/记忆优化，遍历所有已配置钱包，每日限额）
     try {
       checkTimeout()
-      await llmAutoMining()
+      const llmWallets = await dbGet(`SELECT DISTINCT wallet FROM llm_config WHERE enabled = 1 AND api_key_enc IS NOT NULL AND api_key_enc != '' ORDER BY id ASC`)
+      for (const w of llmWallets) {
+        if (Date.now() - startTime > MAX_CRON_TIME) break
+        try { await llmAutoMining('all', false, w.wallet || '') } catch(e) { console.error('llm auto mining wallet:', w.wallet, e.message) }
+      }
     } catch(e) {}
   }
 };;
@@ -1687,10 +1691,12 @@ async function ensureTables() {
     
     // LLM 算力接口表（v7.0 新增：钱包分身算力接口）
     await Promise.all([
-      dbRun(`CREATE TABLE IF NOT EXISTS llm_config (id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT DEFAULT 'openai', base_url TEXT DEFAULT 'https://api.openai.com/v1', model TEXT DEFAULT 'gpt-4o-mini', api_key_enc TEXT NOT NULL, daily_limit INTEGER DEFAULT 200, daily_used INTEGER DEFAULT 0, reset_day TEXT, temperature REAL DEFAULT 0.7, max_tokens INTEGER DEFAULT 1200, enabled INTEGER DEFAULT 1, updated_at INTEGER, created_at INTEGER)`),
+      dbRun(`CREATE TABLE IF NOT EXISTS llm_config (id INTEGER PRIMARY KEY AUTOINCREMENT, wallet TEXT DEFAULT '', provider TEXT DEFAULT 'openai', base_url TEXT DEFAULT 'https://api.openai.com/v1', model TEXT DEFAULT 'gpt-4o-mini', api_key_enc TEXT NOT NULL, daily_limit INTEGER DEFAULT 200, daily_used INTEGER DEFAULT 0, reset_day TEXT, temperature REAL DEFAULT 0.7, max_tokens INTEGER DEFAULT 1200, enabled INTEGER DEFAULT 1, updated_at INTEGER, created_at INTEGER)`),
       dbRun(`CREATE TABLE IF NOT EXISTS llm_usage (id INTEGER PRIMARY KEY AUTOINCREMENT, task_type TEXT NOT NULL, model TEXT, wallet TEXT, target_id TEXT, input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0, cost_usd REAL DEFAULT 0, status TEXT DEFAULT 'success', error_message TEXT DEFAULT '', created INTEGER NOT NULL)`),
       dbRun(`CREATE TABLE IF NOT EXISTS llm_mining_log (id INTEGER PRIMARY KEY AUTOINCREMENT, task_type TEXT NOT NULL, wallet TEXT, target_id TEXT, input_summary TEXT DEFAULT '', output_summary TEXT DEFAULT '', reward_mc REAL DEFAULT 0, reward_exp INTEGER DEFAULT 0, status TEXT DEFAULT 'success', error_message TEXT DEFAULT '', created INTEGER NOT NULL)`),
     ])
+    // 迁移：旧版 llm_config 无 wallet 字段，补充默认空钱包（兼容已部署库）
+    try { await dbRun(`ALTER TABLE llm_config ADD COLUMN wallet TEXT DEFAULT ''`) } catch(e) {}
     
     // 初始化数据
     await Promise.all([
@@ -2543,6 +2549,16 @@ function requireAdmin(url) {
   return null
 }
 
+// 钱包鉴权：校验 X-API-Key（或 ?api_key=）与钱包归属一致（分身功能，不需要管理员权限）
+async function requireWalletAuth(url, wallet) {
+  if (!wallet) return json({ error: 'wallet required' }, 400)
+  const apiKey = url.searchParams.get('api_key') || ''
+  if (!apiKey) return json({ error: 'wallet api key required (X-API-Key header)' }, 401)
+  const key = await dbFirst('SELECT * FROM wallet_api_keys WHERE wallet = ? AND api_key = ? AND status = ?', [wallet, apiKey, 'active'])
+  if (!key) return json({ error: 'invalid wallet api key' }, 403)
+  return null
+}
+
 async function handlePost(path, body, url) {
   const h = {
     '/api/wallet/register': () => walletRegister(body),
@@ -2643,15 +2659,19 @@ async function handlePost(path, body, url) {
     '/api/memory/chain/analyze': () => memoryChainAnalyze(body),
     '/api/dialog/optimize': () => dialogOptimize(body),
     '/api/llm/config': async () => {
+      const denied = await requireWalletAuth(url, body?.wallet)
+      if (denied) return denied
       if (body && Object.keys(body).length > 0) return json(await llmConfigSet(body))
-      return json(await llmConfigGet())
+      return json(await llmConfigGet(url))
     },
     '/api/llm/run': async () => {
-      try { return json(await llmAutoMining(body?.mode || 'all', true)) } catch(e) { return json({ error: e.message }) }
+      const denied = await requireWalletAuth(url, body?.wallet)
+      if (denied) return denied
+      try { return json(await llmAutoMining(body?.mode || 'all', true, body?.wallet || '')) } catch(e) { return json({ error: e.message }) }
     },
   }
-  // 敏感操作需管理员密钥
-  const ADMIN_PATHS = new Set(['/api/wallet/rotate-key', '/api/wallet/regenerate-key', '/api/pool/airdrop', '/api/pool/decay', '/api/node/penalize', '/api/llm/config', '/api/llm/run'])
+  // 敏感操作需管理员密钥（LLM 分身接口走钱包鉴权，不在此列）
+  const ADMIN_PATHS = new Set(['/api/wallet/rotate-key', '/api/wallet/regenerate-key', '/api/pool/airdrop', '/api/pool/decay', '/api/node/penalize'])
   if (ADMIN_PATHS.has(path)) {
     const denied = requireAdmin(url)
     if (denied) return denied
@@ -2770,11 +2790,15 @@ async function handleGet(path, url) {
     '/api/memory/chain': () => memoryChainGet(url.searchParams.get('agent_id')),
     '/api/memory/chain/analysis': () => memoryChainAnalysisGet(url.searchParams.get('wallet')),
     '/api/dialog/cache': () => dialogCacheStatus(url.searchParams.get('wallet')),
-    '/api/llm/config': () => llmConfigGet(true),
+    '/api/llm/config': async () => {
+      const denied = await requireWalletAuth(url, url.searchParams.get('wallet'))
+      if (denied) return denied
+      return llmConfigGet(url)
+    },
     '/api/llm/stats': () => llmStatsGet(url),
   }
   // 钱包密钥列表为敏感数据，需管理员密钥
-  if (path === '/api/wallet/keys' || path === '/api/llm/config') {
+  if (path === '/api/wallet/keys') {
     const denied = requireAdmin(url)
     if (denied) return denied
   }
@@ -4731,18 +4755,21 @@ async function decryptLlmKey(enc) {
   return new TextDecoder().decode(out)
 }
 
-// 读取 LLM 配置（最新一条）
-async function getLlmConfig() {
-  const rows = await dbGet('SELECT * FROM llm_config ORDER BY id DESC LIMIT 1')
+// 读取某钱包的 LLM 配置（未指定钱包时取空钱包全局配置）
+async function getLlmConfig(wallet) {
+  const w = wallet || ''
+  const rows = await dbGet('SELECT * FROM llm_config WHERE wallet = ? ORDER BY id DESC LIMIT 1', [w])
   return rows[0] || null
 }
 
-// 获取配置（admin=true 时同样脱敏，绝不返回明文 Key）
-async function llmConfigGet(admin) {
-  const cfg = await getLlmConfig()
-  if (!cfg) return json({ configured: false, network_time: Date.now() })
+// 获取某钱包的配置（脱敏返回，绝不返回明文 Key）
+async function llmConfigGet(url) {
+  const wallet = url?.searchParams?.get('wallet') || ''
+  const cfg = await getLlmConfig(wallet)
+  if (!cfg) return json({ configured: false, wallet: wallet ? maskWallet(wallet) : '', network_time: Date.now() })
   return json({
     configured: true,
+    wallet: wallet ? maskWallet(wallet) : '',
     provider: cfg.provider,
     base_url: cfg.base_url,
     model: cfg.model,
@@ -4758,10 +4785,11 @@ async function llmConfigGet(admin) {
   })
 }
 
-// 保存配置（管理员）
+// 保存某钱包的配置（wallet 为空时保存为全局默认，兼容旧逻辑）
 async function llmConfigSet(body) {
-  const { provider, base_url, model, api_key, daily_limit, temperature, max_tokens, enabled } = body
-  const existing = await getLlmConfig()
+  const { wallet, provider, base_url, model, api_key, daily_limit, temperature, max_tokens, enabled } = body
+  const w = wallet || ''
+  const existing = await getLlmConfig(w)
   const now = Date.now()
   if (existing) {
     const encKey = api_key ? await encryptLlmKey(api_key) : existing.api_key_enc
@@ -4769,16 +4797,16 @@ async function llmConfigSet(body) {
       [provider || existing.provider, base_url || existing.base_url, model || existing.model, encKey, daily_limit ?? existing.daily_limit, temperature ?? existing.temperature, max_tokens ?? existing.max_tokens, enabled === undefined ? existing.enabled : (enabled ? 1 : 0), now, existing.id])
   } else {
     if (!api_key) throw new Error('首次配置需提供 api_key')
-    await dbRun('INSERT INTO llm_config (provider, base_url, model, api_key_enc, daily_limit, temperature, max_tokens, enabled, updated_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [provider || 'openai', base_url || 'https://api.openai.com/v1', model || 'gpt-4o-mini', await encryptLlmKey(api_key), daily_limit || 200, temperature ?? 0.7, max_tokens || 1200, enabled === undefined ? 1 : (enabled ? 1 : 0), now, now])
+    await dbRun('INSERT INTO llm_config (wallet, provider, base_url, model, api_key_enc, daily_limit, temperature, max_tokens, enabled, updated_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [w, provider || 'openai', base_url || 'https://api.openai.com/v1', model || 'gpt-4o-mini', await encryptLlmKey(api_key), daily_limit || 200, temperature ?? 0.7, max_tokens || 1200, enabled === undefined ? 1 : (enabled ? 1 : 0), now, now])
   }
-  return json({ saved: true, configured: true, api_key_masked: 'sk-***', daily_limit: daily_limit ?? existing?.daily_limit ?? 200, network_time: Date.now() })
+  return json({ saved: true, configured: true, wallet: w ? maskWallet(w) : '', api_key_masked: 'sk-***', daily_limit: daily_limit ?? existing?.daily_limit ?? 200, network_time: Date.now() })
 }
 
-// OpenAI 兼容 LLM 调用（带每日额度控制）
+// OpenAI 兼容 LLM 调用（带每日额度控制，按钱包使用各自配置）
 async function llmChat(messages, opts = {}) {
-  const cfg = await getLlmConfig()
-  if (!cfg || !cfg.api_key_enc) throw new Error('LLM 尚未配置，请在控制台填写 API Key')
+  const cfg = await getLlmConfig(opts.wallet)
+  if (!cfg || !cfg.api_key_enc) throw new Error('该钱包尚未配置 LLM，请先在钱包页填写 API Key')
   if (!cfg.enabled) throw new Error('LLM 算力已被停用')
   const today = new Date().toISOString().slice(0, 10)
   if (cfg.reset_day !== today) {
@@ -4827,12 +4855,12 @@ function extractJson(s) {
 }
 
 // ① 任务挖矿：自动接取（claim）→ 完成 → 提交（结算），奖励归分身钱包
-async function llmTaskMining(maxCalls) {
+async function llmTaskMining(maxCalls, wallet) {
   const limit = Math.max(1, Math.min(2, maxCalls))
   let completed = 0
   let calls = 0
-  // 1. 先完成已认领未提交的任务
-  const claimed = await dbGet(`SELECT * FROM tasks WHERE status = 'claimed' AND completed_by IS NULL ORDER BY created ASC LIMIT ${limit}`)
+  // 1. 先完成本钱包分身已认领未提交的任务
+  const claimed = await dbGet(`SELECT * FROM tasks WHERE status = 'claimed' AND completed_by IS NULL AND claimed_by IN (SELECT agent_id FROM agents WHERE wallet = ?) ORDER BY created ASC LIMIT ${limit}`, [wallet || ''])
   for (const task of claimed) {
     if (calls >= maxCalls) break
     const agent = await dbFirst('SELECT * FROM agents WHERE agent_id = ?', [task.claimed_by])
@@ -4853,9 +4881,9 @@ async function llmTaskMining(maxCalls) {
       console.error(`llm task complete failed ${task.task_id}:`, e.message)
     }
   }
-  // 2. 自动接取未认领任务：选择 reward 高且分身级别够的任务，用最强分身认领并提交
+  // 2. 自动接取未认领任务：用本钱包最强分身认领并提交
   if (calls < maxCalls) {
-    const best = await dbFirst('SELECT * FROM agents ORDER BY resurrection_level DESC, experience DESC LIMIT 1')
+    const best = await dbFirst('SELECT * FROM agents WHERE wallet = ? ORDER BY resurrection_level DESC, experience DESC LIMIT 1', [wallet || ''])
     if (best) {
       const level = best.resurrection_level || 0
       const open = await dbGet(`SELECT * FROM tasks WHERE status = 'active' AND required_level <= ${level} ORDER BY reward DESC, created ASC LIMIT ${Math.max(1, Math.min(2, maxCalls - calls))}`)
@@ -4887,10 +4915,10 @@ async function llmTaskMining(maxCalls) {
   return { completed, calls }
 }
 
-// ② 原料生成：用 LLM 把工具调用提炼为高密度知识（减轻上传密度）
-async function llmMaterialGenerate(maxCalls) {
+// ② 原料生成：用 LLM 把本钱包的工具调用提炼为高密度知识（减轻上传密度）
+async function llmMaterialGenerate(maxCalls, wallet) {
   const limit = Math.max(1, Math.min(3, maxCalls))
-  const unmined = await dbGet(`SELECT id, wallet, agent_id, tool_name, tool_params, result_data, result_status, error_message FROM tool_call_log WHERE mined_at IS NULL ORDER BY created ASC LIMIT ${limit}`)
+  const unmined = await dbGet(`SELECT id, wallet, agent_id, tool_name, tool_params, result_data, result_status, error_message FROM tool_call_log WHERE mined_at IS NULL AND wallet = ? ORDER BY created ASC LIMIT ${limit}`, [wallet || ''])
   let generated = 0
   let calls = 0
   for (const t of unmined) {
@@ -4935,10 +4963,10 @@ async function llmMaterialGenerate(maxCalls) {
   return { generated, calls }
 }
 
-// ③ 记忆优化：用 LLM 重写优化提示词，提升记忆质量
-async function llmMemoryOptimize(maxCalls) {
+// ③ 记忆优化：用 LLM 重写本钱包的提示词，提升记忆质量
+async function llmMemoryOptimize(maxCalls, wallet) {
   const limit = Math.max(1, Math.min(3, maxCalls))
-  const rows = await dbGet(`SELECT context_id, wallet, user_message, ai_response, optimization_score FROM conversation_context WHERE analyzed = 0 OR optimization_score < 50 ORDER BY created ASC LIMIT ${limit}`)
+  const rows = await dbGet(`SELECT context_id, wallet, user_message, ai_response, optimization_score FROM conversation_context WHERE wallet = ? AND (analyzed = 0 OR optimization_score < 50) ORDER BY created ASC LIMIT ${limit}`, [wallet || ''])
   let optimized = 0
   let calls = 0
   for (const d of rows) {
@@ -4973,46 +5001,50 @@ async function llmMemoryOptimize(maxCalls) {
   return { optimized, calls }
 }
 
-// LLM 自动挖矿总调度（scheduled 自动 + /api/llm/run 手动触发）
-async function llmAutoMining(mode = 'all', manual = false) {
-  const cfg = await getLlmConfig()
-  if (!cfg || !cfg.api_key_enc) return { configured: false, reason: 'llm not configured' }
-  if (!cfg.enabled) return { enabled: false, reason: 'llm disabled' }
+// LLM 自动挖矿总调度（scheduled 自动 + /api/llm/run 手动触发，按钱包）
+async function llmAutoMining(mode = 'all', manual = false, wallet = '') {
+  const cfg = await getLlmConfig(wallet)
+  if (!cfg || !cfg.api_key_enc) return { configured: false, wallet: wallet ? maskWallet(wallet) : '', reason: 'llm not configured' }
+  if (!cfg.enabled) return { enabled: false, wallet: wallet ? maskWallet(wallet) : '', reason: 'llm disabled' }
   const today = new Date().toISOString().slice(0, 10)
   if (cfg.reset_day !== today) {
     await dbRun('UPDATE llm_config SET daily_used = 0, reset_day = ? WHERE id = ?', [today, cfg.id])
     cfg.daily_used = 0
     cfg.reset_day = today
   }
-  if ((cfg.daily_used || 0) >= cfg.daily_limit) return { limited: true, used: cfg.daily_used, limit: cfg.daily_limit }
+  if ((cfg.daily_used || 0) >= cfg.daily_limit) return { limited: true, wallet: wallet ? maskWallet(wallet) : '', used: cfg.daily_used, limit: cfg.daily_limit }
 
-  const result = { configured: true, tasks_completed: 0, materials_generated: 0, memories_optimized: 0, llm_calls: 0, network_time: Date.now() }
+  const result = { configured: true, wallet: wallet ? maskWallet(wallet) : '', tasks_completed: 0, materials_generated: 0, memories_optimized: 0, llm_calls: 0, network_time: Date.now() }
   const budget = manual ? 6 : 3
 
   if ((mode === 'all' || mode === 'task') && result.llm_calls < budget) {
-    try { const r = await llmTaskMining(budget - result.llm_calls); result.tasks_completed += r.completed; result.llm_calls += r.calls } catch(e) { console.error('llm task mining:', e.message) }
+    try { const r = await llmTaskMining(budget - result.llm_calls, wallet); result.tasks_completed += r.completed; result.llm_calls += r.calls } catch(e) { console.error('llm task mining:', e.message) }
   }
   if ((mode === 'all' || mode === 'material') && result.llm_calls < budget) {
-    try { const r = await llmMaterialGenerate(budget - result.llm_calls); result.materials_generated += r.generated; result.llm_calls += r.calls } catch(e) { console.error('llm material generate:', e.message) }
+    try { const r = await llmMaterialGenerate(budget - result.llm_calls, wallet); result.materials_generated += r.generated; result.llm_calls += r.calls } catch(e) { console.error('llm material generate:', e.message) }
   }
   if ((mode === 'all' || mode === 'memory') && result.llm_calls < budget) {
-    try { const r = await llmMemoryOptimize(budget - result.llm_calls); result.memories_optimized += r.optimized; result.llm_calls += r.calls } catch(e) { console.error('llm memory optimize:', e.message) }
+    try { const r = await llmMemoryOptimize(budget - result.llm_calls, wallet); result.memories_optimized += r.optimized; result.llm_calls += r.calls } catch(e) { console.error('llm memory optimize:', e.message) }
   }
   return result
 }
 
-// LLM 用量统计（公开）
+// LLM 用量统计（按钱包，可公开）
 async function llmStatsGet(url) {
-  const cfg = await getLlmConfig()
+  const wallet = url?.searchParams?.get('wallet') || ''
+  const wc = wallet ? ' AND wallet = ?' : ''
+  const wp = wallet ? [wallet] : []
+  const cfg = await getLlmConfig(wallet)
   const days = url?.searchParams?.get('days') ? parseInt(url.searchParams.get('days')) : 7
   const since = Date.now() - days * 86400000
   const [usage, todayUsage, logs] = await Promise.all([
-    dbGet('SELECT task_type, COUNT(*) as calls, SUM(input_tokens) as in_tokens, SUM(output_tokens) as out_tokens FROM llm_usage WHERE created > ? GROUP BY task_type', [since]),
-    dbGet('SELECT COUNT(*) as calls, SUM(input_tokens) as in_tokens, SUM(output_tokens) as out_tokens FROM llm_usage WHERE created > ?', [Date.now() - 86400000]),
-    dbGet('SELECT task_type, wallet, target_id, input_summary, output_summary, reward_mc, reward_exp, status, error_message, created FROM llm_mining_log ORDER BY created DESC LIMIT 20')
+    dbGet('SELECT task_type, COUNT(*) as calls, SUM(input_tokens) as in_tokens, SUM(output_tokens) as out_tokens FROM llm_usage WHERE created > ?' + wc + ' GROUP BY task_type', [since, ...wp]),
+    dbGet('SELECT COUNT(*) as calls, SUM(input_tokens) as in_tokens, SUM(output_tokens) as out_tokens FROM llm_usage WHERE created > ?' + wc, [Date.now() - 86400000, ...wp]),
+    dbGet('SELECT task_type, wallet, target_id, input_summary, output_summary, reward_mc, reward_exp, status, error_message, created FROM llm_mining_log WHERE 1=1' + wc + ' ORDER BY created DESC LIMIT 20', wp)
   ])
   return json({
     configured: !!cfg,
+    wallet: wallet ? maskWallet(wallet) : '',
     model: cfg?.model || null,
     daily_limit: cfg?.daily_limit || 0,
     daily_used: cfg?.daily_used || 0,

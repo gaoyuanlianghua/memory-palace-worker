@@ -303,13 +303,14 @@ function resolveUrl(path) {
 }
 
 /* ---------- API 请求层 ---------- */
-async function api(method, path, body) {
+async function api(method, path, body, adminKey) {
   await ensureProbed();
   const origins = store.origins;
   const attempts = Math.max(1, origins.length);
   for (let i = 0; i <= attempts; i++) {
     const headers = { 'Content-Type': 'application/json' };
-    if (store.apiKey) headers['X-API-Key'] = store.apiKey;
+    if (adminKey) headers['X-API-Key'] = adminKey;
+    else if (store.apiKey) headers['X-API-Key'] = store.apiKey;
     let res;
     try {
       res = await fetch(resolveUrl(path), {
@@ -322,7 +323,7 @@ async function api(method, path, body) {
       throw new Error('网络请求失败：' + e.message);
     }
     if (res.status === 401) throw new Error('API Key 无效或已过期，请到设置中更新');
-    if (res.status === 403) throw new Error('权限不足：需要管理员 API Key');
+    if (res.status === 403) throw new Error('权限不足：API Key 与钱包不匹配，请绑定正确的钱包 API Key');
     if (res.status === 429) throw new Error('请求过于频繁，请稍后再试');
     if (res.status >= 500 && failover()) continue;
     const data = await res.json().catch(() => ({}));
@@ -470,6 +471,10 @@ pages.wallet = {
       '<button class="btn btn-ok btn-sm" onclick="doTransfer()">🔄 转账</button>'+
       '<button class="btn btn-ghost btn-sm" onclick="doDeposit()">⬆️ 存入公池</button>'+
       '<button class="btn btn-danger btn-sm" onclick="doWithdraw()">⬇️ 提取</button></div>'));
+
+    out.push(card('🤖 LLM 算力（钱包分身）','🤖', '大模型 API Key 作为分身算力：自动完成任务挖矿/记忆挖矿/记忆优化，每日限额控制成本',
+      '<div id="llmPanelWallet">'+spinner('加载 LLM 算力状态…')+'</div>'));
+    setTimeout(() => renderLlmPanel('llmPanelWallet'), 80);
 
     try {
       const keys = await api('GET', '/api/wallet/keys');
@@ -1116,29 +1121,35 @@ function logout() {
   cacheBust(); toast('已退出登录','ok'); closeModal(); refreshWalletLine(); refresh();
 }
 
-/* ---------- LLM 算力（钱包分身） ---------- */
+/* ---------- LLM 算力（钱包分身：按钱包鉴权，无需管理员） ---------- */
 const llmShort = (s, n) => { s = String(s || ''); return s.length > n ? s.slice(0, n) + '…' : s; };
-async function renderLlmPanel() {
-  const box = $('llmPanel');
+async function renderLlmPanel(containerId) {
+  const box = $(containerId || 'llmPanel');
   if (!box) return;
+  if (!store.wallet) {
+    box.innerHTML = '<div class="empty"><div class="big">👛</div>请先注册或绑定钱包后配置 LLM 算力<br><button class="btn" style="margin-top:12px" onclick="openRegister()">立即注册</button></div>';
+    return;
+  }
   try {
-    const stats = await api('GET','/api/llm/stats');
+    const wq = '?wallet=' + encodeURIComponent(store.wallet);
+    const stats = await api('GET','/api/llm/stats' + wq);
     let cfgHtml = '';
     try {
-      const cfg = await api('GET','/api/llm/config');
+      const cfg = await api('GET','/api/llm/config' + wq);
       cfgHtml =
         '<div class="frow"><div class="field"><label>API Key（留空保留现有）</label><input id="llmKey" type="password" placeholder="'+esc(cfg.api_key_masked || 'sk-...')+'"></div>'+
         '<div class="field"><label>模型</label><input id="llmModel" value="'+esc(cfg.model || 'gpt-4o-mini')+'"></div></div>'+
         '<div class="frow"><div class="field"><label>Base URL</label><input id="llmBase" value="'+esc(cfg.base_url || 'https://api.openai.com/v1')+'"></div>'+
         '<div class="field"><label>每日限额（次）</label><input id="llmLimit" type="number" min="1" value="'+(cfg.daily_limit || 200)+'"></div></div>'+
-        '<div class="toolbar" style="margin-top:8px"><button class="btn btn-sm" onclick="saveLlmConfig()">保存配置</button>'+
+        '<div class="frow"><div class="field"><label>启用</label><select id="llmEnabled"><option value="1">✅ 启用</option><option value="0">⏸️ 停用</option></select></div></div>'+
+        '<div class="toolbar" style="margin-top:8px"><button class="btn btn-sm" onclick="saveLlmConfig()">💾 保存配置</button>'+
         '<button class="btn btn-sm" onclick="runLlmMining(\'task\')">⛏️ 任务挖矿</button>'+
         '<button class="btn btn-sm" onclick="runLlmMining(\'material\')">🧬 生成原料</button>'+
         '<button class="btn btn-sm" onclick="runLlmMining(\'memory\')">🧠 记忆优化</button>'+
         '<button class="btn btn-sm" onclick="runLlmMining(\'all\')">⚡ 全部执行</button></div>'+
-        '<div class="sub" style="margin-top:6px">密钥仅加密存储于边缘节点，永不回显；scheduled 每分钟自动执行「全部」模式</div>';
+        '<div class="sub" style="margin-top:6px">配置按当前钱包加密存储，仅本人可见；scheduled 每分钟自动执行「全部」模式</div>';
     } catch (e) {
-      cfgHtml = '<div class="err-box">'+esc(e.message)+'</div>';
+      cfgHtml = '<div class="err-box" style="margin-top:6px">'+esc(e.message)+'</div>';
     }
     const byType = (stats.usage_by_type || []).map(u =>
       '<div class="kv"><span class="k">'+esc(u.task_type)+'</span><span class="v">'+u.calls+' 次 · '+((u.in_tokens||0)+(u.out_tokens||0))+' tokens</span></div>').join('');
@@ -1160,22 +1171,23 @@ async function renderLlmPanel() {
   }
 }
 async function saveLlmConfig() {
-  const body = { daily_limit: parseInt($('llmLimit')?.value) || 200 };
+  const body = { wallet: store.wallet, daily_limit: parseInt($('llmLimit')?.value) || 200 };
   const key = ($('llmKey')?.value || '').trim();
   if (key) body.api_key = key;
   if ($('llmModel')?.value) body.model = $('llmModel').value.trim();
   if ($('llmBase')?.value) body.base_url = $('llmBase').value.trim();
+  body.enabled = $('llmEnabled')?.value !== '0';
   try {
     await api('POST','/api/llm/config', body);
     toast('LLM 配置已保存','ok');
-    renderLlmPanel();
+    renderLlmPanel($('llmPanelWallet') ? 'llmPanelWallet' : '');
   } catch(e) { toast(e.message,'err'); }
 }
 async function runLlmMining(mode) {
   try {
-    const d = await api('POST','/api/llm/run',{ mode });
+    const d = await api('POST','/api/llm/run',{ wallet: store.wallet, mode });
     toast('LLM 挖矿完成：任务 '+d.tasks_completed+' · 原料 '+d.materials_generated+' · 优化 '+d.memories_optimized + (d.limited ? '（今日额度已用完）' : ''),'ok');
-    renderLlmPanel(); cacheBust(); refresh();
+    renderLlmPanel($('llmPanelWallet') ? 'llmPanelWallet' : ''); cacheBust(); refresh();
   } catch(e) { toast(e.message,'err'); }
 }
 
