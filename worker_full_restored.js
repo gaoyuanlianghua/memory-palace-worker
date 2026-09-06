@@ -4873,8 +4873,8 @@ async function llmTaskMining(maxCalls, wallet) {
   const limit = Math.max(1, Math.min(2, maxCalls))
   let completed = 0
   let calls = 0
-  // 1. 先完成本钱包分身已认领未提交的任务
-  const claimed = await dbGet(`SELECT * FROM tasks WHERE status = 'claimed' AND completed_by IS NULL AND claimed_by IN (SELECT agent_id FROM agents WHERE wallet = ?) ORDER BY created ASC LIMIT ${limit}`, [wallet || ''])
+  // 1. 先完成本钱包分身已认领未提交的任务（排除 PoW 算力任务，PoW 归算力节点）
+  const claimed = await dbGet(`SELECT * FROM tasks WHERE status = 'claimed' AND completed_by IS NULL AND claimed_by IN (SELECT agent_id FROM agents WHERE wallet = ?) AND task_id NOT LIKE 'TASK_POW_%' AND room != 'mining' ORDER BY created ASC LIMIT ${limit}`, [wallet || ''])
   for (const task of claimed) {
     if (calls >= maxCalls) break
     const agent = await dbFirst('SELECT * FROM agents WHERE agent_id = ?', [task.claimed_by])
@@ -4898,12 +4898,12 @@ async function llmTaskMining(maxCalls, wallet) {
       console.error(`llm task complete failed ${task.task_id}:`, e.message)
     }
   }
-  // 2. 自动接取未认领任务：用本钱包最强分身认领并提交
+  // 2. 自动接取未认领的真实任务（排除 PoW 算力任务，PoW 归算力节点；只接发布者支付/治理类任务）
   if (calls < maxCalls) {
     const best = await dbFirst('SELECT * FROM agents WHERE wallet = ? ORDER BY resurrection_level DESC, experience DESC LIMIT 1', [wallet || ''])
     if (best) {
       const level = best.resurrection_level || 0
-      const open = await dbGet(`SELECT * FROM tasks WHERE status = 'active' AND required_level <= ${level} ORDER BY reward DESC, created ASC LIMIT ${Math.max(1, Math.min(2, maxCalls - calls))}`)
+      const open = await dbGet(`SELECT * FROM tasks WHERE status = 'active' AND room != 'mining' AND task_id NOT LIKE 'TASK_POW_%' AND required_level <= ${level} ORDER BY reward DESC, created ASC LIMIT ${Math.max(1, Math.min(2, maxCalls - calls))}`)
       for (const task of open) {
         if (calls >= maxCalls) break
         try {
@@ -5021,6 +5021,63 @@ async function llmMemoryOptimize(maxCalls, wallet) {
   return { optimized, calls }
 }
 
+// ④ 记忆治理：分身整理节点记忆，产出大模型可调阅的高密度知识（记忆链/工作链沉淀）
+// 治理对象：钱包内未被提炼的对话上下文 + 工具调用，由 LLM 归纳出可复用的洞察，
+// 结果写入 memory_knowledge（source_type=govern）并入记忆链，实现「让记忆成为模型上下文」。
+async function llmMemoryGovern(maxCalls, wallet) {
+  const limit = Math.max(1, Math.min(2, maxCalls))
+  let governed = 0
+  let calls = 0
+  // 汇集本钱包尚未治理的对话上下文（含记忆上下文与工具使用）
+  const rows = await dbGet(`SELECT context_id, user_message, ai_response, tools_used, memory_context, optimized_prompt FROM conversation_context WHERE wallet = ? AND (optimization_score IS NULL OR optimization_score < 50) ORDER BY created ASC LIMIT ${limit}`, [wallet || ''])
+  for (const d of rows) {
+    if (calls >= maxCalls) break
+    try {
+      const tools = safeParse(d.tools_used || '[]', [])
+      const memRefs = safeParse(d.memory_context || '[]', [])
+      const r = await llmChat([
+        { role: 'system', content: '你是记忆宫殿的治理引擎。请把一段对话 + 调用工具提炼为高密度、可被大模型直接调阅的工作链知识。只输出 JSON：{"title":"简短标题","content":"精炼洞察（中文80-200字），包含对话意图、所用工具、可复用方法或结论","tags":["标签1","标签2"]}，不要输出其他内容。' },
+        { role: 'user', content: `对话：${truncateStr(d.user_message || '', 400)}\nAI回复：${truncateStr(d.ai_response || '（无）', 400)}\n使用工具：${truncateStr(JSON.stringify(tools), 200) || '无'}\n关联记忆：${truncateStr(JSON.stringify(memRefs), 200) || '无'}\n请提炼治理性知识。` }
+      ], { task_type: 'memory_govern', wallet: d.wallet, target_id: d.context_id, json: true, max_tokens: 400 })
+      calls++
+      const parsed = safeParse(extractJson(r.content), null)
+      const content = parsed?.content || truncateStr(r.content, 300)
+      const title = parsed?.title || '记忆治理'
+      const tags = Array.isArray(parsed?.tags) ? parsed.tags.slice(0, 5) : []
+      const full = `[治理] ${title} —— ${content}`
+      const hash = normalizeHash(full)
+      const existing = await dbFirst('SELECT knowledge_id FROM memory_knowledge WHERE wallet = ? AND content_hash = ?', [d.wallet, hash])
+      let rewardMc = 0
+      let rewardExp = 0
+      if (!existing) {
+        const qs = Math.min(100, computeQualityScore(full, 'dialog') + 10)
+        const reward = rewardForQuality(qs)
+        rewardMc = reward.mc
+        rewardExp = reward.exp
+        await dbRun('INSERT INTO memory_knowledge (knowledge_id, wallet, agent_id, source_type, source_id, content, content_hash, knowledge_type, quality_score, reward_mc, reward_exp, usage_count, last_accessed, created, mined) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+          ['KNOW_' + randStr(8), d.wallet, '', 'govern', d.context_id, full, hash, tags.includes('skill') ? 'skill' : 'insight', qs, rewardMc, rewardExp, 1, Date.now(), Date.now(), 1])
+        await dbRun('UPDATE wallets SET balance = balance + ? WHERE wallet = ?', [rewardMc, d.wallet])
+        // 沉淀入记忆链（工作链），供大模型作为上下文调阅
+        try {
+          const ag = await dbFirst('SELECT agent_id FROM agents WHERE wallet = ? ORDER BY resurrection_level DESC LIMIT 1', [d.wallet])
+          if (ag) await memoryChainAppend(ag.agent_id, d.wallet, { type: 'govern_knowledge', title, content, tags })
+        } catch(e) {}
+      }
+      await dbRun('UPDATE conversation_context SET optimization_score = MAX(optimization_score, 50), analyzed = 1 WHERE context_id = ?', [d.context_id]).catch(async () => {
+        await dbRun('UPDATE conversation_context SET optimization_score = 50, analyzed = 1 WHERE context_id = ?', [d.context_id])
+      })
+      await dbRun('INSERT INTO llm_mining_log (task_type, wallet, target_id, input_summary, output_summary, reward_mc, reward_exp, status, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        ['memory_govern', d.wallet, d.context_id, truncateStr(title, 100), truncateStr(content, 150), rewardMc, rewardExp, 'success', Date.now()])
+      governed++
+    } catch(e) {
+      await dbRun('INSERT INTO llm_mining_log (task_type, wallet, target_id, input_summary, output_summary, status, error_message, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        ['memory_govern', d.wallet, d.context_id, '记忆治理', '', 'failed', truncateStr(e.message, 200), Date.now()])
+      console.error(`llm govern failed ${d.context_id}:`, e.message)
+    }
+  }
+  return { governed, calls }
+}
+
 // LLM 自动挖矿总调度（scheduled 自动 + /api/llm/run 手动触发，按钱包）
 async function llmAutoMining(mode = 'all', manual = false, wallet = '') {
   const cfg = await getLlmConfig(wallet)
@@ -5034,17 +5091,24 @@ async function llmAutoMining(mode = 'all', manual = false, wallet = '') {
   }
   if ((cfg.daily_used || 0) >= cfg.daily_limit) return { limited: true, wallet: wallet ? maskWallet(wallet) : '', used: cfg.daily_used, limit: cfg.daily_limit }
 
-  const result = { configured: true, wallet: wallet ? maskWallet(wallet) : '', tasks_completed: 0, materials_generated: 0, memories_optimized: 0, llm_calls: 0, network_time: Date.now() }
+  const result = { configured: true, wallet: wallet ? maskWallet(wallet) : '', memories_governed: 0, materials_generated: 0, memories_optimized: 0, tasks_completed: 0, llm_calls: 0, network_time: Date.now() }
   const budget = manual ? 6 : 3
 
-  if ((mode === 'all' || mode === 'task') && result.llm_calls < budget) {
-    try { const r = await llmTaskMining(budget - result.llm_calls, wallet); result.tasks_completed += r.completed; result.llm_calls += r.calls } catch(e) { console.error('llm task mining:', e.message) }
+  // ① 记忆治理优先：整理节点记忆 + 优化工具调用 + 图谱内容 → 沉淀记忆链，形成模型可调阅的上下文/工作链数据
+  if ((mode === 'all' || mode === 'govern') && result.llm_calls < budget) {
+    try { const r = await llmMemoryGovern(budget - result.llm_calls, wallet); result.memories_governed += r.governed; result.llm_calls += r.calls } catch(e) { console.error('llm memory govern:', e.message) }
   }
+  // ② 原料生成：工具调用提炼为高密度知识（减轻上传密度）
   if ((mode === 'all' || mode === 'material') && result.llm_calls < budget) {
     try { const r = await llmMaterialGenerate(budget - result.llm_calls, wallet); result.materials_generated += r.generated; result.llm_calls += r.calls } catch(e) { console.error('llm material generate:', e.message) }
   }
+  // ③ 记忆优化：重写提示词，提升记忆质量
   if ((mode === 'all' || mode === 'memory') && result.llm_calls < budget) {
     try { const r = await llmMemoryOptimize(budget - result.llm_calls, wallet); result.memories_optimized += r.optimized; result.llm_calls += r.calls } catch(e) { console.error('llm memory optimize:', e.message) }
+  }
+  // ④ 外部真任务最后：只接发布者支付/治理类（已排除 PoW 算力任务），不抢占治理预算
+  if ((mode === 'all' || mode === 'task') && result.llm_calls < budget) {
+    try { const r = await llmTaskMining(budget - result.llm_calls, wallet); result.tasks_completed += r.completed; result.llm_calls += r.calls } catch(e) { console.error('llm task mining:', e.message) }
   }
   return result
 }
