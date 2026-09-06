@@ -12,6 +12,9 @@ zone_name = "gyuanpalace.xyz"
 [vars]
 CHAIN_NAME = "GyuanPalace"
 PROTOCOL = "MemoryChain/1.0"
+# 邮件验证码服务（Resend）：填写 API Key 后，修改密码 / 更换邮箱的验证码邮件才会真实发送
+RESEND_API_KEY = ""
+RESEND_FROM = "Memory Palace <noreply@gyuanpalace.xyz>"
 
 [triggers]
 crons = ["* * * * *"]

@@ -1071,8 +1071,8 @@ pages.account = {
         '<div class="kv"><span class="k">已登录设备</span><span class="v">'+d.device_count+' 台</span></div>'+
         '</div>'+
         '<div class="toolbar" style="margin-top:12px;gap:8px;flex-wrap:wrap">'+
-        '<button class="btn btn-sm" onclick="openSetPwd()">🔑 设置/修改密码</button>'+
-        '<button class="btn btn-sm" onclick="openBindEmail()">📧 绑定/更换邮箱</button>'+
+        '<button class="btn btn-sm" onclick="openSetPwd()">🔑 设置/修改密码</button>'+(d.email_changed_this_month?'<span class="badge b-warn" title="本自然月已更换过绑定邮箱，修改密码需下月再进行">本月已换邮箱，改密码需下月</span>':'')+
+        '<button class="btn btn-sm" onclick="openBindEmail()">📧 绑定/更换邮箱</button>'+(d.password_changed_this_month?'<span class="badge b-warn" title="本自然月已修改过登录密码，更换邮箱需下月再进行">本月已改密码，换邮箱需下月</span>':'')+
         '<button class="btn btn-sm" onclick="openRecover()">🛟 找回凭证</button>'+
         '<button class="btn btn-danger btn-sm" onclick="logout()">🚪 退出登录</button></div>'));
     } catch (e) { out.push(card('账户信息','👤','',errBox(e))); }
@@ -1375,7 +1375,9 @@ async function renderAccountPanel(containerId) {
       '<div class="kv" style="margin-top:8px"><span class="k">登录密码</span><span class="v">'+(d.has_password?'已设置 <span class="badge b-ok">'+(d.password_set_at?fmtTime(d.password_set_at):'')+'</span>':'<span class="badge">未设置</span>')+'</span></div>'+
       '<div class="kv"><span class="k">邮箱</span><span class="v">'+esc(d.email_bound?d.email:'未绑定')+'</span></div>'+
       '<div class="kv"><span class="k">API Key</span><span class="v">'+esc(d.api_key_masked||'—')+'</span></div>'+
-      '<div class="kv"><span class="k">已登录设备</span><span class="v">'+d.device_count+' 台</span></div>';
+      '<div class="kv"><span class="k">已登录设备</span><span class="v">'+d.device_count+' 台</span></div>'+
+      (d.email_changed_this_month?'<div class="sub" style="color:var(--warn);margin-top:6px">⚠️ 本自然月已更换过绑定邮箱，修改密码需下月再进行</div>':'')+
+      (d.password_changed_this_month?'<div class="sub" style="color:var(--warn);margin-top:6px">⚠️ 本自然月已修改过登录密码，更换邮箱需下月再进行</div>':'');
   } catch(e) {
     box.innerHTML = '<div class="err-box" style="margin-top:8px">⚠️ '+esc(e.message)+'</div>';
   }

@@ -3444,6 +3444,7 @@ async function accountPasswordReset(body) {
   try {
     await setWalletPassword(wallet, new_password)
   } catch (e) { return json({ error: e.message }, 400) }
+  await dbRun('UPDATE wallet_credentials SET password_changed_at = ? WHERE wallet = ?', [Date.now(), wallet])
   await dbRun('INSERT INTO audit_log (id, wallet, agent_id, action, target, result, reason, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', ['AUD_' + randStr(6), wallet, '', 'account', 'password', 'success', '签名找回重置密码', Date.now()])
   return json({ reset: true, message: '密码已通过钱包签名验证重置', network_time: Date.now() })
 }
@@ -3473,7 +3474,9 @@ async function accountInfo(url) {
   return json({
     wallet: maskWallet(wallet), has_password: !!cred?.password_hash, password_set_at: cred?.password_set_at || 0,
     email: maskedEmail, email_bound: !!email, api_key_masked: key ? key.api_key.slice(0, 3) + '…' + key.api_key.slice(-4) : '',
-    device_count: devices?.cnt || 0, network_time: Date.now()
+    device_count: devices?.cnt || 0, network_time: Date.now(),
+    password_changed_this_month: isSameMonth(cred?.password_changed_at || 0, Date.now()),
+    email_changed_this_month: isSameMonth(cred?.email_changed_at || 0, Date.now()),
   })
 }
 
