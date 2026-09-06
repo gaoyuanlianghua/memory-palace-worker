@@ -1123,9 +1123,14 @@ function logout() {
 
 /* ---------- LLM 算力（钱包分身：按钱包鉴权，无需管理员） ---------- */
 const llmShort = (s, n) => { s = String(s || ''); return s.length > n ? s.slice(0, n) + '…' : s; };
-async function renderLlmPanel(containerId) {
+async function renderLlmPanel(containerId, retryLeft) {
   const box = $(containerId || 'llmPanel');
-  if (!box) return;
+  if (!box) {
+    // DOM 尚未挂载（页面 render 未完成）时延迟重试，最多约 6 秒
+    if ((retryLeft ?? 30) <= 0) return;
+    setTimeout(() => renderLlmPanel(containerId, (retryLeft ?? 30) - 1), 200);
+    return;
+  }
   if (!store.wallet) {
     box.innerHTML = '<div class="empty"><div class="big">👛</div>请先注册或绑定钱包后配置 LLM 算力<br><button class="btn" style="margin-top:12px" onclick="openRegister()">立即注册</button></div>';
     return;
