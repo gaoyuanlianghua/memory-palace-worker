@@ -5291,10 +5291,11 @@ async function llmStatsGet(url) {
   const cfg = await getLlmConfig(wallet)
   const days = url?.searchParams?.get('days') ? parseInt(url.searchParams.get('days')) : 7
   const since = Date.now() - days * 86400000
-  const [usage, todayUsage, logs] = await Promise.all([
+  const [usage, todayUsage, logs, rawCounts] = await Promise.all([
     dbGet('SELECT task_type, COUNT(*) as calls, SUM(input_tokens) as in_tokens, SUM(output_tokens) as out_tokens FROM llm_usage WHERE created > ?' + wc + ' GROUP BY task_type', [since, ...wp]),
     dbGet('SELECT COUNT(*) as calls, SUM(input_tokens) as in_tokens, SUM(output_tokens) as out_tokens FROM llm_usage WHERE created > ?' + wc, [Date.now() - 86400000, ...wp]),
-    dbGet('SELECT task_type, wallet, target_id, input_summary, output_summary, reward_mc, reward_exp, status, error_message, created FROM llm_mining_log WHERE 1=1' + wc + ' ORDER BY created DESC LIMIT 20', wp)
+    dbGet('SELECT task_type, wallet, target_id, input_summary, output_summary, reward_mc, reward_exp, status, error_message, created FROM llm_mining_log WHERE 1=1' + wc + ' ORDER BY created DESC LIMIT 20', wp),
+    dbFirst('SELECT (SELECT COUNT(*) FROM conversation_context WHERE optimization_score IS NULL OR optimization_score < 50) AS ungoverned, (SELECT COUNT(*) FROM tool_call_log WHERE mined_at IS NULL) AS unmined, (SELECT COUNT(*) FROM memory_knowledge WHERE mined = 1 AND (blocked IS NULL OR blocked = 0)) AS unblocked, (SELECT COUNT(*) FROM memory_blocks WHERE (cored IS NULL OR cored = 0)) AS uncored, (SELECT COUNT(*) FROM wallet_nodes WHERE status = \'online\') AS online_nodes')
   ])
   return json({
     configured: !!cfg,
@@ -5304,6 +5305,7 @@ async function llmStatsGet(url) {
     daily_used: cfg?.daily_used || 0,
     enabled: !!(cfg?.enabled),
     period_days: days,
+    raw_counts: rawCounts || { ungoverned: 0, unmined: 0, unblocked: 0, uncored: 0, online_nodes: 0 },
     usage_by_type: usage,
     today: todayUsage[0] || { calls: 0, in_tokens: 0, out_tokens: 0 },
     recent_logs: logs,
