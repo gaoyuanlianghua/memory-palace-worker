@@ -475,6 +475,7 @@ const apiDocs = async () => {
         'POST /api/wallet/challenge {wallet} → 获取 challenge',
         '用钱包私钥签名 challenge → 得到 signature',
         'POST /api/wallet/verify {session_id, wallet, signature} → 获取 session_token',
+        '跨设备：POST /api/device/login {wallet, api_key, device_id, device_name} → 该设备专属 session_token（30 天）',
         '后续请求携带 ?session_token=xxx 或 X-API-Key 头'
       ]
     },
@@ -489,6 +490,10 @@ const apiDocs = async () => {
         { method: 'POST', path: '/api/wallet/register', params: { wallet: 'string - 钱包名称' }, desc: '注册钱包（免费，初始赠送 1.0 MC）', auth: false },
         { method: 'POST', path: '/api/wallet/challenge', params: { wallet: 'string' }, desc: '获取身份验证挑战码', auth: false },
         { method: 'POST', path: '/api/wallet/verify', params: { session_id: 'string', wallet: 'string', signature: 'string - HMAC-SHA256 签名' }, desc: '验证签名获取会话令牌', auth: false },
+        { method: 'POST', path: '/api/device/login', params: { wallet: 'string', api_key: 'string', device_id: 'string(可选)', device_name: 'string(可选)' }, desc: '跨设备登录：为该设备签发独立 session_token（30 天）', auth: 'wallet' },
+        { method: 'GET', path: '/api/device/sessions', params: { wallet: 'string' }, desc: '设备列表：本钱包所有已登录设备', auth: 'wallet' },
+        { method: 'POST', path: '/api/device/logout', params: { session_token: 'string' }, desc: '登出当前设备会话', auth: false },
+        { method: 'POST', path: '/api/device/revoke', params: { wallet: 'string', device_id: 'string' }, desc: '强制下线指定设备', auth: 'wallet' },
         { method: 'GET', path: '/api/wallet/info', params: {}, desc: '钱包列表（已加密掩码）', auth: false },
         { method: 'GET', path: '/api/wallet/status', params: { wallet: 'string' }, desc: '钱包状态（余额、注册时间）', auth: false },
         { method: 'GET', path: '/api/wallet/profile', params: { wallet: 'string' }, desc: '钱包详细资料', auth: 'wallet' },
@@ -1592,6 +1597,10 @@ async function ensureTables() {
       dbRun(`CREATE TABLE IF NOT EXISTS wallet_credentials (wallet TEXT PRIMARY KEY, public_key TEXT, credential_hash TEXT, salt TEXT, algorithm TEXT DEFAULT 'HMAC-SHA256', created INTEGER, last_auth INTEGER DEFAULT 0, auth_count INTEGER DEFAULT 0, status TEXT DEFAULT 'active')`),
       dbRun(`CREATE TABLE IF NOT EXISTS identity_bindings (id TEXT PRIMARY KEY, agent_id TEXT, wallet TEXT, agent_signature TEXT, wallet_signature TEXT, status TEXT DEFAULT 'pending', bound_at INTEGER, expires_at INTEGER, UNIQUE(agent_id, wallet))`),
       dbRun(`CREATE TABLE IF NOT EXISTS auth_sessions (session_id TEXT PRIMARY KEY, wallet TEXT, agent_id TEXT, challenge TEXT, challenge_expires INTEGER, session_token TEXT UNIQUE, status TEXT DEFAULT 'active', created INTEGER, expires_at INTEGER, last_activity INTEGER)`),
+      // 跨设备登录：为会话补充设备信息（幂等补列，兼容线上旧表）
+      dbRun(`ALTER TABLE auth_sessions ADD COLUMN device_id TEXT`).catch(() => {}),
+      dbRun(`ALTER TABLE auth_sessions ADD COLUMN device_name TEXT`).catch(() => {}),
+      dbRun(`ALTER TABLE auth_sessions ADD COLUMN ip_hash TEXT`).catch(() => {}),
       dbRun(`CREATE TABLE IF NOT EXISTS audit_log (id TEXT PRIMARY KEY, wallet TEXT, agent_id TEXT, action TEXT, target TEXT, result TEXT, reason TEXT, ip_hash TEXT, created INTEGER)`),
       dbRun(`CREATE TABLE IF NOT EXISTS events (event_id TEXT PRIMARY KEY, event_type TEXT, actor TEXT, data TEXT DEFAULT '{}', created INTEGER)`),
       dbRun(`CREATE TABLE IF NOT EXISTS memory_chains (chain_id TEXT PRIMARY KEY, agent_id TEXT, wallet TEXT, chain_data TEXT, chain_length INTEGER, compressed_bytes INTEGER, original_bytes INTEGER, level INTEGER DEFAULT 1, checksum TEXT, backup_path TEXT, created INTEGER, updated INTEGER)`),
@@ -2579,9 +2588,18 @@ function requireAdmin(url) {
   return null
 }
 
-// 钱包鉴权：校验 X-API-Key（或 ?api_key=）与钱包归属一致（分身功能，不需要管理员权限）
+// 钱包鉴权：校验 session_token（优先）或 X-API-Key（?api_key=）与钱包归属一致（分身功能，不需要管理员权限）
+// 跨设备登录接入：任一设备登录后获得的 session_token 可直接携带 ?session_token=xxx 鉴权
 async function requireWalletAuth(url, wallet) {
   if (!wallet) return json({ error: 'wallet required' }, 400)
+  const token = url.searchParams.get('session_token') || ''
+  if (token) {
+    const session = await dbFirst('SELECT * FROM auth_sessions WHERE session_token = ? AND status = ? AND expires_at > ?', [token, 'active', Date.now()])
+    if (!session) return json({ error: 'invalid or expired session_token' }, 403)
+    if (session.wallet !== wallet) return json({ error: 'cross-wallet access forbidden' }, 403)
+    await dbRun('UPDATE auth_sessions SET last_activity = ? WHERE session_id = ?', [Date.now(), session.session_id])
+    return null
+  }
   const apiKey = url.searchParams.get('api_key') || ''
   if (!apiKey) return json({ error: 'wallet api key required (X-API-Key header)' }, 401)
   const key = await dbFirst('SELECT * FROM wallet_api_keys WHERE wallet = ? AND api_key = ? AND status = ?', [wallet, apiKey, 'active'])
@@ -2594,6 +2612,9 @@ async function handlePost(path, body, url) {
     '/api/wallet/register': () => walletRegister(body),
     '/api/wallet/challenge': () => walletChallenge(body),
     '/api/wallet/verify': () => walletVerify(body),
+    '/api/device/login': () => deviceLogin(body, url),
+    '/api/device/logout': () => deviceLogout(body),
+    '/api/device/revoke': () => deviceRevoke(body, url),
     '/api/wallet/withdraw': () => walletWithdraw(body),
     '/api/wallet/deposit': () => walletDeposit(body),
     '/api/palace/command': () => palaceCommand(body),
@@ -2813,6 +2834,7 @@ async function handleGet(path, url) {
     '/api/chinese/idioms': () => chineseIdioms(url),
     '/api/wallet/profile': () => walletProfile(url),
     '/api/wallet/memory_stats': () => walletMemoryStats(url),
+    '/api/device/sessions': () => deviceSessionsList(url),
     '/api/memory/export': () => memoryChainExport(url),
     '/api/memory/export/all': () => memoryChainExportAll(url),
     '/api/broadcast/schedule': () => broadcastScheduleList(url.searchParams.get('wallet')),
@@ -3110,6 +3132,79 @@ async function walletVerify(body) {
   await dbRun('UPDATE auth_sessions SET status = ?, session_token = ? WHERE wallet = ? AND challenge = ?', ['active', sessionToken, wallet, challenge])
   await dbRun('UPDATE wallet_credentials SET last_auth = ?, auth_count = auth_count + 1 WHERE wallet = ?', [Date.now(), wallet])
   return json({ verified: true, wallet: maskWallet(wallet), session_token: sessionToken, expires_in: 3600000 })
+}
+
+// ============================================================
+// 📱 跨设备登录：设备会话管理（接入记忆宫殿）
+// 任一设备用「钱包 + API Key」登录，获得独立 session_token；可列出/注销已登录设备
+// ============================================================
+const DEVICE_SESSION_TTL = 30 * 24 * 3600000 // 设备会话有效期 30 天
+
+// 设备登录：校验钱包 API Key，为该设备签发独立 session_token（多设备可同时在线）
+async function deviceLogin(body, url) {
+  const { wallet, api_key, device_id, device_name } = body
+  if (!wallet || !api_key) return json({ error: 'wallet and api_key required' }, 400)
+  const key = await dbFirst('SELECT * FROM wallet_api_keys WHERE wallet = ? AND api_key = ? AND status = ?', [wallet, api_key, 'active'])
+  if (!key) return json({ error: 'invalid wallet api key' }, 403)
+  const now = Date.now()
+  const sessionId = 'DEV_' + randStr(8)
+  const sessionToken = await hmacSign(wallet + ':device:' + now + ':' + randStr(6), wallet)
+  const device = device_name || '未命名设备'
+  // 相同设备重复登录：复用并刷新原会话（旧 token 失效），避免无限堆积
+  const existing = await dbFirst('SELECT session_id FROM auth_sessions WHERE wallet = ? AND device_id = ? AND status = ?', [wallet, device_id || '', 'active'])
+  if (existing) {
+    await dbRun('UPDATE auth_sessions SET session_token = ?, device_name = ?, status = ?, expires_at = ?, last_activity = ? WHERE session_id = ?',
+      [sessionToken, device, 'active', now + DEVICE_SESSION_TTL, now, existing.session_id])
+  } else {
+    await dbRun('INSERT INTO auth_sessions (session_id, wallet, agent_id, challenge, challenge_expires, session_token, status, created, expires_at, last_activity, device_id, device_name, ip_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [sessionId, wallet, '', '', 0, sessionToken, 'active', now, now + DEVICE_SESSION_TTL, now, device_id || '', device, ''])
+  }
+  return json({ logged_in: true, session_token: sessionToken, device_id: device_id || '', device_name: device, expires_in: DEVICE_SESSION_TTL, wallet: maskWallet(wallet), network_time: Date.now() })
+}
+
+// 设备列表：列出某钱包当前所有活跃设备（需 session_token 或 api_key 鉴权）
+async function deviceSessionsList(url) {
+  const wallet = url.searchParams.get('wallet') || ''
+  if (!wallet) return json({ error: 'wallet required' }, 400)
+  const denied = await requireWalletAuth(url, wallet)
+  if (denied) return denied
+  const now = Date.now()
+  const rows = await dbGet(`SELECT session_id, device_id, device_name, agent_id, status, created, last_activity, expires_at FROM auth_sessions WHERE wallet = ? ORDER BY created DESC LIMIT 50`, [wallet])
+  return json({
+    wallet: maskWallet(wallet),
+    total: rows.length,
+    current_session: url.searchParams.get('session_token') || '',
+    devices: rows.map(s => ({
+      session_id: s.session_id, device_id: s.device_id || '',
+      device_name: s.device_name || '未命名设备', agent_id: s.agent_id || '',
+      status: s.status, created: s.created, last_activity: s.last_activity || 0,
+      expires_at: s.expires_at || 0, expired: (s.expires_at || 0) < now
+    })),
+    network_time: now
+  })
+}
+
+// 设备登出：注销当前设备会话（携带 session_token）
+async function deviceLogout(body) {
+  const { session_token } = body
+  if (!session_token) return json({ error: 'session_token required' }, 400)
+  const session = await dbFirst('SELECT * FROM auth_sessions WHERE session_token = ?', [session_token])
+  if (!session) return json({ error: 'invalid session_token' }, 404)
+  await dbRun('UPDATE auth_sessions SET status = ? WHERE session_id = ?', ['revoked', session.session_id])
+  return json({ logged_out: true, device_name: session.device_name || '未命名设备', wallet: maskWallet(session.wallet), network_time: Date.now() })
+}
+
+// 设备注销：管理员/本人从设备列表强制下线某台设备（需本人 session_token 或 api_key）
+async function deviceRevoke(body, url) {
+  const { session_token, device_id } = body
+  const wallet = body.wallet || url?.searchParams?.get('wallet') || ''
+  if (!wallet || !device_id) return json({ error: 'wallet and device_id required' }, 400)
+  const denied = await requireWalletAuth(url, wallet)
+  if (denied) return denied
+  const target = await dbFirst('SELECT * FROM auth_sessions WHERE wallet = ? AND device_id = ? AND status = ?', [wallet, device_id, 'active'])
+  if (!target) return json({ error: 'device not found or already logged out' }, 404)
+  await dbRun('UPDATE auth_sessions SET status = ? WHERE session_id = ?', ['revoked', target.session_id])
+  return json({ revoked: true, device_id, device_name: target.device_name || '未命名设备', network_time: Date.now() })
 }
 
 async function walletInfo(url) {
@@ -3832,6 +3927,28 @@ async function memoryChainCreate(agent_id, wallet, data) {
   return await dbFirst('SELECT * FROM memory_chains WHERE chain_id = ?', [chainId])
 }
 
+// 链压缩摘要：LLM 把即将被压缩下线的旧记忆事件提炼为一条精炼知识（供大模型后续直接调阅）
+// 未配置 LLM 或调用失败时返回 null，调用方回退为通用压缩文案
+async function chainCompressSummarize(wallet, oldEvents) {
+  const events = (oldEvents || []).slice(-60)
+  if (!events.length) return null
+  try {
+    const lines = events.map((e, i) => `${i + 1}. [${e.type || 'event'}] ${truncateStr(e.content || JSON.stringify(e), 120)}`).join('\n')
+    const r = await llmChat([
+      { role: 'system', content: '你是记忆宫殿的链压缩摘要引擎。请把一批即将压缩下线的旧记忆事件提炼为一条精炼的中文知识摘要（60-150字），保留关键结论、行为模式与可复用信息，供大模型作为长期上下文直接调阅。只输出 JSON：{"content":"摘要内容","knowledge_type":"behavior|skill|preference|relation|fact"}，不要输出其他内容。' },
+      { role: 'user', content: `旧记忆事件（共${events.length}条）：\n${lines}\n请生成链压缩摘要。` }
+    ], { task_type: 'chain_compress', wallet: wallet, json: true, max_tokens: 300 })
+    const parsed = safeParse(extractJson(r.content), null)
+    const content = parsed?.content || truncateStr(r.content, 300)
+    if (!content) return null
+    const knowledge_type = ['behavior', 'skill', 'preference', 'relation', 'fact'].includes(parsed?.knowledge_type) ? parsed.knowledge_type : 'fact'
+    return { content, knowledge_type }
+  } catch (e) {
+    console.error('chain compress summarize:', e.message)
+    return null
+  }
+}
+
 async function memoryChainAppend(agent_id, wallet, event) {
   let chain = await dbFirst('SELECT * FROM memory_chains WHERE agent_id = ?', [agent_id])
   if (!chain) chain = await memoryChainCreate(agent_id, wallet, event)
@@ -3843,7 +3960,21 @@ async function memoryChainAppend(agent_id, wallet, event) {
   if (data.length > 100 || chainData.length > 10000) {
     const recent = data.slice(-20)
     const old = data.slice(0, -20)
-    const summary = {compressed: true, count: old.length, summary: `前 ${old.length} 条记忆已压缩`}
+    let summaryText = `前 ${old.length} 条记忆已压缩`
+    let kid = ''
+    // 压缩摘要自主导入记忆宫殿：LLM 提炼旧事件为精炼知识并写入 memory_knowledge（mined=1 进入治理链路）
+    try {
+      const compressed = await chainCompressSummarize(wallet, old)
+      if (compressed && compressed.content) {
+        summaryText = compressed.content
+        kid = 'KN_' + randStr(8)
+        const full = `[链压缩摘要] ${summaryText}`
+        const qs = Math.min(100, computeQualityScore(full, 'dialog') + 10)
+        await dbRun('INSERT INTO memory_knowledge (knowledge_id, wallet, agent_id, source_type, source_id, content, content_hash, knowledge_type, quality_score, reward_mc, reward_exp, usage_count, created, mined, mined_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+          [kid, wallet, '', 'chain_compress', 'memory_chain', summaryText, await hmacSign(full, wallet), compressed.knowledge_type || 'fact', qs, 0, 0, 1, Date.now(), 1, Date.now()])
+      }
+    } catch(e) { console.error('chain compress summarize:', e.message) }
+    const summary = {compressed: true, count: old.length, summary: summaryText, knowledge_id: kid}
     chainData = JSON.stringify([...old.slice(0, 1), summary, ...recent])
     compressedBytes = chainData.length
     originalBytes = data.length * (chainData.length / recent.length)
