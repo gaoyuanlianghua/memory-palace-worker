@@ -5295,9 +5295,17 @@ async function llmStatsGet(url) {
     dbGet('SELECT task_type, COUNT(*) as calls, SUM(input_tokens) as in_tokens, SUM(output_tokens) as out_tokens FROM llm_usage WHERE created > ?' + wc + ' GROUP BY task_type', [since, ...wp]),
     dbGet('SELECT COUNT(*) as calls, SUM(input_tokens) as in_tokens, SUM(output_tokens) as out_tokens FROM llm_usage WHERE created > ?' + wc, [Date.now() - 86400000, ...wp]),
     dbGet('SELECT task_type, wallet, target_id, input_summary, output_summary, reward_mc, reward_exp, status, error_message, created FROM llm_mining_log WHERE 1=1' + wc + ' ORDER BY created DESC LIMIT 20', wp),
-    dbFirst(wallet
-      ? `SELECT (SELECT COUNT(*) FROM conversation_context WHERE wallet = ? AND (optimization_score IS NULL OR optimization_score < 50)) AS ungoverned, (SELECT COUNT(*) FROM tool_call_log WHERE wallet = ? AND mined_at IS NULL) AS unmined, (SELECT COUNT(*) FROM memory_knowledge WHERE wallet = ? AND mined = 1 AND (blocked IS NULL OR blocked = 0)) AS unblocked, (SELECT COUNT(*) FROM memory_blocks WHERE wallet = ? AND (cored IS NULL OR cored = 0)) AS uncored, (SELECT COUNT(*) FROM wallet_nodes WHERE status = 'online') AS online_nodes`
-      : `SELECT (SELECT COUNT(*) FROM conversation_context WHERE optimization_score IS NULL OR optimization_score < 50) AS ungoverned, (SELECT COUNT(*) FROM tool_call_log WHERE mined_at IS NULL) AS unmined, (SELECT COUNT(*) FROM memory_knowledge WHERE mined = 1 AND (blocked IS NULL OR blocked = 0)) AS unblocked, (SELECT COUNT(*) FROM memory_blocks WHERE (cored IS NULL OR cored = 0)) AS uncored, (SELECT COUNT(*) FROM wallet_nodes WHERE status = 'online') AS online_nodes`, wallet ? [wallet, wallet, wallet, wallet] : [])
+    (async () => {
+      const tryCnt = async (sql, params) => { try { const r = await dbFirst(sql, params); return r?.cnt || 0 } catch(e) { return -1 } }
+      const wc2 = wallet ? ' AND wallet = ?' : ''
+      return {
+        ungoverned: await tryCnt('SELECT COUNT(*) cnt FROM conversation_context WHERE (optimization_score IS NULL OR optimization_score < 50)' + wc2, wallet ? [wallet] : []),
+        unmined: await tryCnt('SELECT COUNT(*) cnt FROM tool_call_log WHERE mined_at IS NULL' + wc2, wallet ? [wallet] : []),
+        unblocked: await tryCnt('SELECT COUNT(*) cnt FROM memory_knowledge WHERE mined = 1 AND (blocked IS NULL OR blocked = 0)' + wc2, wallet ? [wallet] : []),
+        uncored: await tryCnt('SELECT COUNT(*) cnt FROM memory_blocks WHERE (cored IS NULL OR cored = 0)' + wc2, wallet ? [wallet] : []),
+        online_nodes: await tryCnt(`SELECT COUNT(*) cnt FROM wallet_nodes WHERE status = 'online'`, [])
+      }
+    })()
   ])
   return json({
     configured: !!cfg,
