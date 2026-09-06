@@ -4826,12 +4826,13 @@ function extractJson(s) {
   return m ? m[0] : null
 }
 
-// ① 任务挖矿：为已认领任务自动生成结果并结算
+// ① 任务挖矿：自动接取（claim）→ 完成 → 提交（结算），奖励归分身钱包
 async function llmTaskMining(maxCalls) {
   const limit = Math.max(1, Math.min(2, maxCalls))
-  const claimed = await dbGet(`SELECT * FROM tasks WHERE status = 'claimed' AND completed_by IS NULL ORDER BY created ASC LIMIT ${limit}`)
   let completed = 0
   let calls = 0
+  // 1. 先完成已认领未提交的任务
+  const claimed = await dbGet(`SELECT * FROM tasks WHERE status = 'claimed' AND completed_by IS NULL ORDER BY created ASC LIMIT ${limit}`)
   for (const task of claimed) {
     if (calls >= maxCalls) break
     const agent = await dbFirst('SELECT * FROM agents WHERE agent_id = ?', [task.claimed_by])
@@ -4850,6 +4851,37 @@ async function llmTaskMining(maxCalls) {
       await dbRun('INSERT INTO llm_mining_log (task_type, wallet, target_id, input_summary, output_summary, status, error_message, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
         ['task_complete', agent?.wallet || '', task.task_id, truncateStr(task.title, 100), '', 'failed', truncateStr(e.message, 200), Date.now()])
       console.error(`llm task complete failed ${task.task_id}:`, e.message)
+    }
+  }
+  // 2. 自动接取未认领任务：选择 reward 高且分身级别够的任务，用最强分身认领并提交
+  if (calls < maxCalls) {
+    const best = await dbFirst('SELECT * FROM agents ORDER BY resurrection_level DESC, experience DESC LIMIT 1')
+    if (best) {
+      const level = best.resurrection_level || 0
+      const open = await dbGet(`SELECT * FROM tasks WHERE status = 'active' AND required_level <= ${level} ORDER BY reward DESC, created ASC LIMIT ${Math.max(1, Math.min(2, maxCalls - calls))}`)
+      for (const task of open) {
+        if (calls >= maxCalls) break
+        try {
+          // 接取任务
+          const claimRes = await taskClaim({ task_id: task.task_id, agent_id: best.agent_id, wallet: best.wallet })
+          const claimBody = await claimRes.json().catch(() => null)
+          if (!claimBody || claimBody.claimed !== true) continue
+          // 完成并提交
+          const r = await llmChat([
+            { role: 'system', content: '你是记忆宫殿中的分身助手。请根据任务要求完成工作，输出简洁可验证的结果（中文，200字内，包含关键步骤与产出物）。' },
+            { role: 'user', content: `任务：${task.title}\n要求：${task.description || '无'}\n所在房间：${task.room || 'general'}\n请输出完成结果。` }
+          ], { task_type: 'task_complete', wallet: best.wallet, target_id: task.task_id, max_tokens: 500 })
+          calls++
+          await taskComplete({ task_id: task.task_id, agent_id: best.agent_id, wallet: best.wallet, result: truncateStr(r.content, 800) })
+          await dbRun('INSERT INTO llm_mining_log (task_type, wallet, target_id, input_summary, output_summary, reward_mc, reward_exp, status, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            ['task_auto_complete', best.wallet, task.task_id, truncateStr(task.title, 100), truncateStr(r.content, 200), 0, 0, 'success', Date.now()])
+          completed++
+        } catch(e) {
+          await dbRun('INSERT INTO llm_mining_log (task_type, wallet, target_id, input_summary, output_summary, status, error_message, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            ['task_auto_complete', best.wallet, task.task_id, truncateStr(task.title, 100), '', 'failed', truncateStr(e.message, 200), Date.now()])
+          console.error(`llm task auto failed ${task.task_id}:`, e.message)
+        }
+      }
     }
   }
   return { completed, calls }
