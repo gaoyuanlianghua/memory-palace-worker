@@ -9,3 +9,12 @@ export const MemoryPage = lazy(() => import('../../domains/memory/pages/MemoryPa
 export const GraphPage = lazy(() => import('../../domains/graph/pages/GraphPage').then((m) => ({ default: m.GraphPage })));
 export const PoolPage = lazy(() => import('../../domains/pool/pages/PoolPage').then((m) => ({ default: m.PoolPage })));
 export const AuditPage = lazy(() => import('../../domains/audit/pages/AuditPage').then((m) => ({ default: m.AuditPage })));
+export const MiningPage = lazy(() => import('../../domains/mining/pages/MiningPage').then((m) => ({ default: m.MiningPage })));
+export const BroadcastPage = lazy(() => import('../../domains/broadcast/pages/BroadcastPage').then((m) => ({ default: m.BroadcastPage })));
+export const WorkflowPage = lazy(() => import('../../domains/workflow/pages/WorkflowPage').then((m) => ({ default: m.WorkflowPage })));
+export const DebtPage = lazy(() => import('../../domains/debt/pages/DebtPage').then((m) => ({ default: m.DebtPage })));
+export const GovernancePage = lazy(() => import('../../domains/governance/pages/GovernancePage').then((m) => ({ default: m.GovernancePage })));
+export const HeatmapPage = lazy(() => import('../../domains/heatmap/pages/HeatmapPage').then((m) => ({ default: m.HeatmapPage })));
+export const DialogPage = lazy(() => import('../../domains/dialog/pages/DialogPage').then((m) => ({ default: m.DialogPage })));
+export const ToolsPage = lazy(() => import('../../domains/tools/pages/ToolsPage').then((m) => ({ default: m.ToolsPage })));
+export const ChinesePage = lazy(() => import('../../domains/chinese/pages/ChinesePage').then((m) => ({ default: m.ChinesePage })));

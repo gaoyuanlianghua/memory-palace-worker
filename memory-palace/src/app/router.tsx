@@ -5,6 +5,8 @@ import { Spinner } from '../shared/ui';
 import {
   PalacePage, SystemPage, WalletPage, AgentPage,
   TaskPage, MemoryPage, GraphPage, PoolPage, AuditPage,
+  MiningPage, BroadcastPage, WorkflowPage, DebtPage, GovernancePage,
+  HeatmapPage, DialogPage, ToolsPage, ChinesePage,
 } from './routes/lazy';
 import { RequireAdmin } from './routes/guards';
 
@@ -25,6 +27,15 @@ export const router = createBrowserRouter([
       { path: 'pool', element: withSuspense(<RequireAdmin><PoolPage /></RequireAdmin>) },
       { path: 'system', element: withSuspense(<SystemPage />) },
       { path: 'audit', element: withSuspense(<RequireAdmin><AuditPage /></RequireAdmin>) },
+      { path: 'mining', element: withSuspense(<MiningPage />) },
+      { path: 'broadcast', element: withSuspense(<BroadcastPage />) },
+      { path: 'workflow', element: withSuspense(<WorkflowPage />) },
+      { path: 'debt', element: withSuspense(<DebtPage />) },
+      { path: 'governance', element: withSuspense(<GovernancePage />) },
+      { path: 'heatmap', element: withSuspense(<HeatmapPage />) },
+      { path: 'dialog', element: withSuspense(<DialogPage />) },
+      { path: 'tools', element: withSuspense(<ToolsPage />) },
+      { path: 'chinese', element: withSuspense(<ChinesePage />) },
       { path: '*', element: <Navigate to="/dashboard" replace /> },
     ],
   },

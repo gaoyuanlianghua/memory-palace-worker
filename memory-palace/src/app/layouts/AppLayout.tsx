@@ -14,6 +14,15 @@ const navItems = [
   { to: '/pool', label: '系统池', icon: '🏦' },
   { to: '/system', label: '系统统计', icon: '📈' },
   { to: '/audit', label: '操作日志', icon: '📜' },
+  { to: '/mining', label: '挖矿', icon: '⛏️' },
+  { to: '/broadcast', label: '广播', icon: '📢' },
+  { to: '/workflow', label: '工作流', icon: '🔀' },
+  { to: '/debt', label: '债务', icon: '💳' },
+  { to: '/governance', label: '治理', icon: '🏛️' },
+  { to: '/heatmap', label: '热度图谱', icon: '🌡️' },
+  { to: '/dialog', label: '对话优化', icon: '💬' },
+  { to: '/tools', label: '工具中心', icon: '🧰' },
+  { to: '/chinese', label: '中华文化', icon: '🀄' },
 ];
 
 export function AppLayout() {

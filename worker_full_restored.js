@@ -441,6 +441,12 @@ export default {
       checkTimeout()
       await poolCreatePowTask()
     } catch(e) {}
+    
+    // 8. LLM 自动挖矿（钱包分身算力接口：完成任务/生成原料/记忆优化，每日限额）
+    try {
+      checkTimeout()
+      await llmAutoMining()
+    } catch(e) {}
   }
 };;
 
@@ -1679,6 +1685,13 @@ async function ensureTables() {
       dbRun(`CREATE TABLE IF NOT EXISTS wallet_session (wallet TEXT PRIMARY KEY, total_conversations INTEGER DEFAULT 0, total_tool_calls INTEGER DEFAULT 0, avg_quality_score REAL DEFAULT 0, avg_optimization_score REAL DEFAULT 0, favorite_tools TEXT DEFAULT '[]', last_active INTEGER, created INTEGER NOT NULL)`),
     ])
     
+    // LLM 算力接口表（v7.0 新增：钱包分身算力接口）
+    await Promise.all([
+      dbRun(`CREATE TABLE IF NOT EXISTS llm_config (id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT DEFAULT 'openai', base_url TEXT DEFAULT 'https://api.openai.com/v1', model TEXT DEFAULT 'gpt-4o-mini', api_key_enc TEXT NOT NULL, daily_limit INTEGER DEFAULT 200, daily_used INTEGER DEFAULT 0, reset_day TEXT, temperature REAL DEFAULT 0.7, max_tokens INTEGER DEFAULT 1200, enabled INTEGER DEFAULT 1, updated_at INTEGER, created_at INTEGER)`),
+      dbRun(`CREATE TABLE IF NOT EXISTS llm_usage (id INTEGER PRIMARY KEY AUTOINCREMENT, task_type TEXT NOT NULL, model TEXT, wallet TEXT, target_id TEXT, input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0, cost_usd REAL DEFAULT 0, status TEXT DEFAULT 'success', error_message TEXT DEFAULT '', created INTEGER NOT NULL)`),
+      dbRun(`CREATE TABLE IF NOT EXISTS llm_mining_log (id INTEGER PRIMARY KEY AUTOINCREMENT, task_type TEXT NOT NULL, wallet TEXT, target_id TEXT, input_summary TEXT DEFAULT '', output_summary TEXT DEFAULT '', reward_mc REAL DEFAULT 0, reward_exp INTEGER DEFAULT 0, status TEXT DEFAULT 'success', error_message TEXT DEFAULT '', created INTEGER NOT NULL)`),
+    ])
+    
     // 初始化数据
     await Promise.all([
       dbRun(`INSERT OR IGNORE INTO worker_secrets (key, value, description, updated_at) VALUES ('cf_account_id', 'AD75E8E45B6EEEA0b0D6F7C97AEB83BE', 'Cloudflare Account ID', Date.now())`),
@@ -2629,9 +2642,16 @@ async function handlePost(path, body, url) {
     '/api/heartbeat/report': () => heartbeatReport(body),
     '/api/memory/chain/analyze': () => memoryChainAnalyze(body),
     '/api/dialog/optimize': () => dialogOptimize(body),
+    '/api/llm/config': async () => {
+      if (body && Object.keys(body).length > 0) return json(await llmConfigSet(body))
+      return json(await llmConfigGet())
+    },
+    '/api/llm/run': async () => {
+      try { return json(await llmAutoMining(body?.mode || 'all', true)) } catch(e) { return json({ error: e.message }) }
+    },
   }
   // 敏感操作需管理员密钥
-  const ADMIN_PATHS = new Set(['/api/wallet/rotate-key', '/api/wallet/regenerate-key', '/api/pool/airdrop', '/api/pool/decay', '/api/node/penalize'])
+  const ADMIN_PATHS = new Set(['/api/wallet/rotate-key', '/api/wallet/regenerate-key', '/api/pool/airdrop', '/api/pool/decay', '/api/node/penalize', '/api/llm/config', '/api/llm/run'])
   if (ADMIN_PATHS.has(path)) {
     const denied = requireAdmin(url)
     if (denied) return denied
@@ -2750,9 +2770,11 @@ async function handleGet(path, url) {
     '/api/memory/chain': () => memoryChainGet(url.searchParams.get('agent_id')),
     '/api/memory/chain/analysis': () => memoryChainAnalysisGet(url.searchParams.get('wallet')),
     '/api/dialog/cache': () => dialogCacheStatus(url.searchParams.get('wallet')),
+    '/api/llm/config': () => llmConfigGet(true),
+    '/api/llm/stats': () => llmStatsGet(url),
   }
   // 钱包密钥列表为敏感数据，需管理员密钥
-  if (path === '/api/wallet/keys') {
+  if (path === '/api/wallet/keys' || path === '/api/llm/config') {
     const denied = requireAdmin(url)
     if (denied) return denied
   }
@@ -4672,6 +4694,303 @@ async function memoryMining() {
   }
 
   return { mined: totalMined, wallets_affected: walletsAffected, knowledge_created: knowledgeCreated, knowledge_duped: knowledgeDuped, network_time: Date.now() }
+}
+
+// ============================================================
+// 🤖 LLM 算力接口（v7.0：钱包分身算力接口）
+// 用大模型 API Key 作为钱包分身的算力，后台完成记忆挖矿/任务挖矿/记忆优化
+// ============================================================
+
+// 加密密钥：优先用环境变量 LLM_ENC_KEY，否则由管理员密钥派生
+async function llmEncKey() {
+  if (ENV?.LLM_ENC_KEY) return ENV.LLM_ENC_KEY
+  return await hmacSign(getAdminApiKey() || 'memorypalace', 'llm-enc-key-v1')
+}
+
+// 轻量 XOR 混淆存储（Worker 无持久主密钥，用于防止明文泄露）
+async function encryptLlmKey(plain) {
+  const key = await llmEncKey()
+  const enc = new TextEncoder()
+  const data = enc.encode(plain || '')
+  const k = enc.encode(key)
+  const out = new Uint8Array(data.length)
+  for (let i = 0; i < data.length; i++) out[i] = data[i] ^ k[i % k.length]
+  let bin = ''
+  for (let i = 0; i < out.length; i++) bin += String.fromCharCode(out[i])
+  return 'v1:' + btoa(bin)
+}
+async function decryptLlmKey(enc) {
+  if (!enc) return ''
+  const key = await llmEncKey()
+  let payload = enc
+  if (payload.startsWith('v1:')) payload = payload.slice(3)
+  const bin = atob(payload)
+  const k = new TextEncoder().encode(key)
+  const out = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i) ^ k[i % k.length]
+  return new TextDecoder().decode(out)
+}
+
+// 读取 LLM 配置（最新一条）
+async function getLlmConfig() {
+  const rows = await dbGet('SELECT * FROM llm_config ORDER BY id DESC LIMIT 1')
+  return rows[0] || null
+}
+
+// 获取配置（admin=true 时同样脱敏，绝不返回明文 Key）
+async function llmConfigGet(admin) {
+  const cfg = await getLlmConfig()
+  if (!cfg) return json({ configured: false, network_time: Date.now() })
+  return json({
+    configured: true,
+    provider: cfg.provider,
+    base_url: cfg.base_url,
+    model: cfg.model,
+    api_key_masked: cfg.api_key_enc ? 'sk-***' + (cfg.api_key_enc.length > 8 ? cfg.api_key_enc.slice(-4) : '') : '',
+    daily_limit: cfg.daily_limit,
+    daily_used: cfg.daily_used,
+    reset_day: cfg.reset_day,
+    temperature: cfg.temperature,
+    max_tokens: cfg.max_tokens,
+    enabled: !!cfg.enabled,
+    updated_at: cfg.updated_at,
+    network_time: Date.now()
+  })
+}
+
+// 保存配置（管理员）
+async function llmConfigSet(body) {
+  const { provider, base_url, model, api_key, daily_limit, temperature, max_tokens, enabled } = body
+  const existing = await getLlmConfig()
+  const now = Date.now()
+  if (existing) {
+    const encKey = api_key ? await encryptLlmKey(api_key) : existing.api_key_enc
+    await dbRun('UPDATE llm_config SET provider = ?, base_url = ?, model = ?, api_key_enc = ?, daily_limit = ?, temperature = ?, max_tokens = ?, enabled = ?, updated_at = ? WHERE id = ?',
+      [provider || existing.provider, base_url || existing.base_url, model || existing.model, encKey, daily_limit ?? existing.daily_limit, temperature ?? existing.temperature, max_tokens ?? existing.max_tokens, enabled === undefined ? existing.enabled : (enabled ? 1 : 0), now, existing.id])
+  } else {
+    if (!api_key) throw new Error('首次配置需提供 api_key')
+    await dbRun('INSERT INTO llm_config (provider, base_url, model, api_key_enc, daily_limit, temperature, max_tokens, enabled, updated_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [provider || 'openai', base_url || 'https://api.openai.com/v1', model || 'gpt-4o-mini', await encryptLlmKey(api_key), daily_limit || 200, temperature ?? 0.7, max_tokens || 1200, enabled === undefined ? 1 : (enabled ? 1 : 0), now, now])
+  }
+  return json({ saved: true, configured: true, api_key_masked: 'sk-***', daily_limit: daily_limit ?? existing?.daily_limit ?? 200, network_time: Date.now() })
+}
+
+// OpenAI 兼容 LLM 调用（带每日额度控制）
+async function llmChat(messages, opts = {}) {
+  const cfg = await getLlmConfig()
+  if (!cfg || !cfg.api_key_enc) throw new Error('LLM 尚未配置，请在控制台填写 API Key')
+  if (!cfg.enabled) throw new Error('LLM 算力已被停用')
+  const today = new Date().toISOString().slice(0, 10)
+  if (cfg.reset_day !== today) {
+    await dbRun('UPDATE llm_config SET daily_used = 0, reset_day = ? WHERE id = ?', [today, cfg.id])
+    cfg.daily_used = 0
+    cfg.reset_day = today
+  }
+  if ((cfg.daily_used || 0) >= cfg.daily_limit) throw new Error(`今日 LLM 调用额度已用完（${cfg.daily_used}/${cfg.daily_limit}）`)
+  const apiKey = await decryptLlmKey(cfg.api_key_enc)
+  const base = (cfg.base_url || 'https://api.openai.com/v1').replace(/\/+$/, '')
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 20000)
+  let res
+  try {
+    res = await fetch(base + '/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
+      body: JSON.stringify({
+        model: cfg.model || 'gpt-4o-mini',
+        messages,
+        temperature: opts.temperature ?? cfg.temperature ?? 0.7,
+        max_tokens: opts.max_tokens || cfg.max_tokens || 1200,
+        response_format: opts.json ? { type: 'json_object' } : undefined
+      }),
+      signal: controller.signal
+    })
+  } finally { clearTimeout(timer) }
+  if (!res.ok) {
+    const errText = (await res.text().catch(() => '')).slice(0, 200)
+    throw new Error(`LLM 调用失败 ${res.status}: ${errText}`)
+  }
+  const data = await res.json()
+  const usage = data.usage || { prompt_tokens: 0, completion_tokens: 0 }
+  cfg.daily_used += 1
+  await dbRun('UPDATE llm_config SET daily_used = ?, reset_day = ? WHERE id = ?', [cfg.daily_used, today, cfg.id])
+  await dbRun('INSERT INTO llm_usage (task_type, model, wallet, target_id, input_tokens, output_tokens, cost_usd, status, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    [opts.task_type || 'general', cfg.model, opts.wallet || '', opts.target_id || '', usage.prompt_tokens || 0, usage.completion_tokens || 0, 0, 'success', Date.now()])
+  return { content: data.choices?.[0]?.message?.content || '', usage }
+}
+
+// 从 LLM 输出中提取 JSON
+function extractJson(s) {
+  if (!s) return null
+  const m = s.match(/\{[\s\S]*\}/)
+  return m ? m[0] : null
+}
+
+// ① 任务挖矿：为已认领任务自动生成结果并结算
+async function llmTaskMining(maxCalls) {
+  const limit = Math.max(1, Math.min(2, maxCalls))
+  const claimed = await dbGet(`SELECT * FROM tasks WHERE status = 'claimed' AND completed_by IS NULL ORDER BY created ASC LIMIT ${limit}`)
+  let completed = 0
+  let calls = 0
+  for (const task of claimed) {
+    if (calls >= maxCalls) break
+    const agent = await dbFirst('SELECT * FROM agents WHERE agent_id = ?', [task.claimed_by])
+    if (!agent) continue
+    try {
+      const r = await llmChat([
+        { role: 'system', content: '你是记忆宫殿中的分身助手。请根据任务要求完成工作，输出简洁可验证的结果（中文，200字内，包含关键步骤与产出物）。' },
+        { role: 'user', content: `任务：${task.title}\n要求：${task.description || '无'}\n所在房间：${task.room || 'general'}\n请输出完成结果。` }
+      ], { task_type: 'task_complete', wallet: agent.wallet, target_id: task.task_id, max_tokens: 500 })
+      calls++
+      await taskComplete({ task_id: task.task_id, agent_id: task.claimed_by, result: truncateStr(r.content, 800) })
+      await dbRun('INSERT INTO llm_mining_log (task_type, wallet, target_id, input_summary, output_summary, reward_mc, reward_exp, status, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        ['task_complete', agent.wallet, task.task_id, truncateStr(task.title, 100), truncateStr(r.content, 200), 0, 0, 'success', Date.now()])
+      completed++
+    } catch(e) {
+      await dbRun('INSERT INTO llm_mining_log (task_type, wallet, target_id, input_summary, output_summary, status, error_message, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        ['task_complete', agent?.wallet || '', task.task_id, truncateStr(task.title, 100), '', 'failed', truncateStr(e.message, 200), Date.now()])
+      console.error(`llm task complete failed ${task.task_id}:`, e.message)
+    }
+  }
+  return { completed, calls }
+}
+
+// ② 原料生成：用 LLM 把工具调用提炼为高密度知识（减轻上传密度）
+async function llmMaterialGenerate(maxCalls) {
+  const limit = Math.max(1, Math.min(3, maxCalls))
+  const unmined = await dbGet(`SELECT id, wallet, agent_id, tool_name, tool_params, result_data, result_status, error_message FROM tool_call_log WHERE mined_at IS NULL ORDER BY created ASC LIMIT ${limit}`)
+  let generated = 0
+  let calls = 0
+  for (const t of unmined) {
+    if (calls >= maxCalls) break
+    try {
+      const r = await llmChat([
+        { role: 'system', content: '你是记忆宫殿的知识提炼引擎。请把一次工具调用提炼为结构化知识，只输出 JSON：{"title":"简短标题","content":"精炼知识内容（中文60-150字，保留关键参数与结果）","type":"fact|insight|skill"}，不要输出其他内容。' },
+        { role: 'user', content: `工具：${t.tool_name}\n输入：${truncateStr(t.tool_params || '', 500) || '无'}\n输出：${truncateStr(t.result_data || '', 800) || '无'}${t.error_message ? '\n错误：' + truncateStr(t.error_message, 100) : ''}` }
+      ], { task_type: 'material_generate', wallet: t.wallet, target_id: t.id, json: true, max_tokens: 400 })
+      calls++
+      const parsed = safeParse(extractJson(r.content), null)
+      const content = parsed?.content || truncateStr(r.content, 300)
+      const ktype = ['fact', 'insight', 'skill'].includes(parsed?.type) ? parsed.type : 'fact'
+      const full = `[${t.tool_name}] ${content}`
+      const hash = normalizeHash(full)
+      const existing = await dbFirst('SELECT knowledge_id FROM memory_knowledge WHERE wallet = ? AND content_hash = ?', [t.wallet, hash])
+      let rewardMc = 0
+      let rewardExp = 0
+      if (!existing) {
+        const qs = Math.min(100, computeQualityScore(full, 'tool_call') + 10)
+        const reward = rewardForQuality(qs)
+        rewardMc = reward.mc
+        rewardExp = reward.exp
+        await dbRun('INSERT INTO memory_knowledge (knowledge_id, wallet, agent_id, source_type, source_id, content, content_hash, knowledge_type, quality_score, reward_mc, reward_exp, usage_count, last_accessed, created, mined) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+          ['KNOW_' + randStr(8), t.wallet, t.agent_id || '', 'llm_mined', t.id, full, hash, ktype, qs, rewardMc, rewardExp, 1, Date.now(), Date.now(), 1])
+        await dbRun('UPDATE wallets SET balance = balance + ? WHERE wallet = ?', [rewardMc, t.wallet])
+        if (t.agent_id) {
+          const ag = await dbFirst('SELECT experience FROM agents WHERE agent_id = ?', [t.agent_id])
+          if (ag) await dbRun('UPDATE agents SET experience = experience + ? WHERE agent_id = ?', [rewardExp, t.agent_id])
+        }
+      }
+      await dbRun('UPDATE tool_call_log SET mined_at = ? WHERE id = ?', [Date.now(), t.id])
+      await dbRun('INSERT INTO llm_mining_log (task_type, wallet, target_id, input_summary, output_summary, reward_mc, reward_exp, status, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        ['material_generate', t.wallet, t.id, truncateStr(t.tool_name, 50), truncateStr(content, 150), rewardMc, rewardExp, 'success', Date.now()])
+      generated++
+    } catch(e) {
+      await dbRun('INSERT INTO llm_mining_log (task_type, wallet, target_id, input_summary, output_summary, status, error_message, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        ['material_generate', t.wallet, t.id, truncateStr(t.tool_name, 50), '', 'failed', truncateStr(e.message, 200), Date.now()])
+      console.error(`llm material failed ${t.id}:`, e.message)
+    }
+  }
+  return { generated, calls }
+}
+
+// ③ 记忆优化：用 LLM 重写优化提示词，提升记忆质量
+async function llmMemoryOptimize(maxCalls) {
+  const limit = Math.max(1, Math.min(3, maxCalls))
+  const rows = await dbGet(`SELECT context_id, wallet, user_message, ai_response, optimization_score FROM conversation_context WHERE analyzed = 0 OR optimization_score < 50 ORDER BY created ASC LIMIT ${limit}`)
+  let optimized = 0
+  let calls = 0
+  for (const d of rows) {
+    if (calls >= maxCalls) break
+    try {
+      const r = await llmChat([
+        { role: 'system', content: '你是记忆宫殿的对话优化引擎。请把用户输入改写为更清晰、上下文更完整的优化提示词（中文，保留原意，补充隐含上下文与意图，50-150字），只输出优化后的提示词文本。' },
+        { role: 'user', content: `用户输入：${truncateStr(d.user_message || '', 500)}\nAI 回复：${truncateStr(d.ai_response || '（无）', 500)}\n优化后提示词：` }
+      ], { task_type: 'memory_optimize', wallet: d.wallet, target_id: d.context_id, max_tokens: 400 })
+      calls++
+      const optimizedPrompt = truncateStr((r.content || '').trim(), 1000)
+      const optScore = Math.min(95, 50 + Math.min(45, Math.floor(optimizedPrompt.length / 10)))
+      await dbRun('UPDATE conversation_context SET optimized_prompt = ?, optimization_score = ?, analyzed = 1 WHERE context_id = ?', [optimizedPrompt, optScore, d.context_id])
+      const hash = normalizeHash(optimizedPrompt)
+      const existing = await dbFirst('SELECT knowledge_id FROM memory_knowledge WHERE wallet = ? AND content_hash = ?', [d.wallet, hash])
+      if (!existing) {
+        const qs = Math.min(100, computeQualityScore(optimizedPrompt, 'dialog') + 15)
+        const reward = rewardForQuality(qs)
+        await dbRun('INSERT INTO memory_knowledge (knowledge_id, wallet, agent_id, source_type, source_id, content, content_hash, knowledge_type, quality_score, reward_mc, reward_exp, usage_count, last_accessed, created, mined) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+          ['KNOW_' + randStr(8), d.wallet, '', 'llm_optimized', d.context_id, optimizedPrompt, hash, 'intent', qs, reward.mc, reward.exp, 1, Date.now(), Date.now(), 1)
+        await dbRun('UPDATE wallets SET balance = balance + ? WHERE wallet = ?', [reward.mc, d.wallet])
+      }
+      await dbRun('INSERT INTO llm_mining_log (task_type, wallet, target_id, input_summary, output_summary, reward_mc, reward_exp, status, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        ['memory_optimize', d.wallet, d.context_id, truncateStr(d.user_message || '', 100), truncateStr(optimizedPrompt, 150), 0, 0, 'success', Date.now()])
+      optimized++
+    } catch(e) {
+      await dbRun('INSERT INTO llm_mining_log (task_type, wallet, target_id, input_summary, output_summary, status, error_message, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        ['memory_optimize', d.wallet, d.context_id, truncateStr(d.user_message || '', 100), '', 'failed', truncateStr(e.message, 200), Date.now()])
+      console.error(`llm memory optimize failed ${d.context_id}:`, e.message)
+    }
+  }
+  return { optimized, calls }
+}
+
+// LLM 自动挖矿总调度（scheduled 自动 + /api/llm/run 手动触发）
+async function llmAutoMining(mode = 'all', manual = false) {
+  const cfg = await getLlmConfig()
+  if (!cfg || !cfg.api_key_enc) return { configured: false, reason: 'llm not configured' }
+  if (!cfg.enabled) return { enabled: false, reason: 'llm disabled' }
+  const today = new Date().toISOString().slice(0, 10)
+  if (cfg.reset_day !== today) {
+    await dbRun('UPDATE llm_config SET daily_used = 0, reset_day = ? WHERE id = ?', [today, cfg.id])
+    cfg.daily_used = 0
+    cfg.reset_day = today
+  }
+  if ((cfg.daily_used || 0) >= cfg.daily_limit) return { limited: true, used: cfg.daily_used, limit: cfg.daily_limit }
+
+  const result = { configured: true, tasks_completed: 0, materials_generated: 0, memories_optimized: 0, llm_calls: 0, network_time: Date.now() }
+  const budget = manual ? 6 : 3
+
+  if ((mode === 'all' || mode === 'task') && result.llm_calls < budget) {
+    try { const r = await llmTaskMining(budget - result.llm_calls); result.tasks_completed += r.completed; result.llm_calls += r.calls } catch(e) { console.error('llm task mining:', e.message) }
+  }
+  if ((mode === 'all' || mode === 'material') && result.llm_calls < budget) {
+    try { const r = await llmMaterialGenerate(budget - result.llm_calls); result.materials_generated += r.generated; result.llm_calls += r.calls } catch(e) { console.error('llm material generate:', e.message) }
+  }
+  if ((mode === 'all' || mode === 'memory') && result.llm_calls < budget) {
+    try { const r = await llmMemoryOptimize(budget - result.llm_calls); result.memories_optimized += r.optimized; result.llm_calls += r.calls } catch(e) { console.error('llm memory optimize:', e.message) }
+  }
+  return result
+}
+
+// LLM 用量统计（公开）
+async function llmStatsGet(url) {
+  const cfg = await getLlmConfig()
+  const days = url?.searchParams?.get('days') ? parseInt(url.searchParams.get('days')) : 7
+  const since = Date.now() - days * 86400000
+  const [usage, todayUsage, logs] = await Promise.all([
+    dbGet('SELECT task_type, COUNT(*) as calls, SUM(input_tokens) as in_tokens, SUM(output_tokens) as out_tokens FROM llm_usage WHERE created > ? GROUP BY task_type', [since]),
+    dbGet('SELECT COUNT(*) as calls, SUM(input_tokens) as in_tokens, SUM(output_tokens) as out_tokens FROM llm_usage WHERE created > ?', [Date.now() - 86400000]),
+    dbGet('SELECT task_type, wallet, target_id, input_summary, output_summary, reward_mc, reward_exp, status, error_message, created FROM llm_mining_log ORDER BY created DESC LIMIT 20')
+  ])
+  return json({
+    configured: !!cfg,
+    model: cfg?.model || null,
+    daily_limit: cfg?.daily_limit || 0,
+    daily_used: cfg?.daily_used || 0,
+    enabled: !!(cfg?.enabled),
+    period_days: days,
+    usage_by_type: usage,
+    today: todayUsage[0] || { calls: 0, in_tokens: 0, out_tokens: 0 },
+    recent_logs: logs,
+    network_time: Date.now()
+  })
 }
 
 async function miningSync(body) {

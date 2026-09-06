@@ -37,6 +37,13 @@ jobs:
           # 多端点候选（逗号分隔，留空 = 同源）。配置仓库 Variables: VITE_API_ORIGINS
           VITE_API_ORIGINS: ${{ vars.VITE_API_ORIGINS }}
 
+      - name: Deploy Worker (gyuanpalace-agent)
+        working-directory: ./memory-palace
+        run: npx wrangler deploy --config wrangler.toml
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
       - name: Deploy to Cloudflare Pages
         uses: cloudflare/pages-action@v1
         with:
