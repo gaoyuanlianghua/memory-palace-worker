@@ -3,6 +3,9 @@
 // 加密钱包 + 身份校验 + 公池经济 + 边缘节点 + 语义网络 + 矿池系统
 // ============================================================
 
+// 导入 Cloudflare Worker Socket API（用于 SMTP 直连）
+import { connect } from 'cloudflare:sockets'
+
 // 全局状态
 let tablesReady = false
 const DASHBOARD_VERSION = 'v4.10.2' // 代码更新时修改此版本号以刷新缓存
@@ -2840,6 +2843,7 @@ async function handleGet(path, url) {
     '/api/semantic/search': async () => json(await semanticSearch(url.searchParams.get('q') || '')),
     '/api/page/config': () => pageConfigGet(url),
     '/api/clones': () => clonesList(url),
+    '/api/_debug_smtp_config': () => json({ has_host: !!(ENV?.SMTP_HOST), has_user: !!(ENV?.SMTP_USER), has_pass: !!(ENV?.SMTP_PASS), host: (ENV?.SMTP_HOST||'').substring(0,30), port: ENV?.SMTP_PORT }),
     '/api/wallet/keys': () => walletKeysList(),
     '/api/memory/detail': () => memoryDetail(url),
     '/api/memory/chains': () => memoryChainList(url),
@@ -2894,15 +2898,6 @@ async function handleGet(path, url) {
     '/api/wallet/memory_stats': () => walletMemoryStats(url),
     '/api/device/sessions': () => deviceSessionsList(url),
     '/api/account/info': () => accountInfo(url),
-    '/api/_debug_env': () => json({
-      has_resend_key: !!(ENV && ENV.RESEND_API_KEY),
-      resend_key_len: ENV && ENV.RESEND_API_KEY ? String(ENV.RESEND_API_KEY).length : 0,
-      has_resend_from: !!(ENV && ENV.RESEND_FROM),
-      has_admin_key: !!(ENV && ENV.ADMIN_API_KEY),
-      has_chain: !!(ENV && ENV.CHAIN_NAME),
-      chain: ENV && ENV.CHAIN_NAME || '',
-      env_keys: Object.keys(ENV || {}),
-    }),
     '/api/memory/export': () => memoryChainExport(url),
     '/api/memory/export/all': () => memoryChainExportAll(url),
     '/api/broadcast/schedule': () => broadcastScheduleList(url.searchParams.get('wallet')),
@@ -3315,33 +3310,185 @@ async function verifyWalletSignatureOnce(wallet, challenge, signature) {
 }
 
 // ============================================================
-// 📧 邮件验证码：修改密码 / 更换邮箱前必须通过邮箱验证（Resend 发送，6 位码，10 分钟有效，一次性）
+// 📧 邮件验证码：修改密码 / 更换邮箱前必须通过邮箱验证（SMTP/SSL 直连，6 位码，10 分钟有效，一次性）
 // ============================================================
 const EMAIL_CODE_TTL = 10 * 60 * 1000 // 10 分钟
 const EMAIL_VERIFY_ACTIONS = ['password', 'email']
 
-// 发送验证码邮件（Resend API；未配置 RESEND_API_KEY 时返回 false，调用方提示）
+// SMTP 读取一行响应（处理多行响应）
+async function smtpRead(reader, maxLines = 50, timeoutMs = 10000) {
+  let buffer = ''
+  const start = Date.now()
+  while (buffer.split('\r\n').length - 1 < maxLines && (Date.now() - start) < timeoutMs) {
+    try {
+      const { value, done } = await Promise.race([
+        reader.read(),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('read_timeout')), timeoutMs))
+      ])
+      if (done) break
+      if (!value || value.length === 0) {
+        await new Promise(r => setTimeout(r, 50))
+        continue
+      }
+      buffer += new TextDecoder().decode(value)
+
+      // SMTP 最终响应行：以 "三位数字+空格" 开头（如 "250 OK"）；多行响应的中间行是 "250-xxx"（连字符）不匹配
+      if (/(?:^|\r\n)\d{3} [^\r\n]*\r\n$/.test(buffer)) break
+    } catch (e) {
+      // 超时：cancel 清理可能 pending 的 read()，避免残留读取抢占后续响应数据
+      try { await reader.cancel() } catch (_) {}
+      break
+    }
+  }
+  return buffer
+}
+
+// 发送验证码邮件（SMTP/SSL 直连，不使用第三方代理）
 async function sendVerifyEmail(to, code, action) {
-  const apiKey = (ENV?.RESEND_API_KEY || '').trim()
-  if (!apiKey) return false
-  const from = (ENV?.RESEND_FROM || '').trim() || 'Memory Palace <noreply@gyuanpalace.xyz>'
+  const host = (ENV?.SMTP_HOST || '').trim()
+  const port = parseInt(ENV?.SMTP_PORT || '465')
+  const user = (ENV?.SMTP_USER || '').trim()
+  const pass = (ENV?.SMTP_PASS || '').trim()
+  const from = (ENV?.SMTP_FROM || '').trim() || user
+
+  // 配置检查：确保必要的SMTP配置存在
+  if (!host) return { ok: false, error: 'SMTP_HOST未配置', logs: [] }
+  if (!user) return { ok: false, error: 'SMTP_USER未配置', logs: [] }
+  if (!pass) return { ok: false, error: 'SMTP_PASS未配置', logs: [] }
+  if (!port || port < 1 || port > 65535) return { ok: false, error: 'SMTP_PORT配置无效', logs: [] }
+
   const subject = action === 'password' ? '【记忆宫殿】修改登录密码验证码' : '【记忆宫殿】更换绑定邮箱验证码'
-  const body =
+  const htmlBody =
     '<div style="font-family:sans-serif;max-width:520px;margin:0 auto;padding:24px;border:1px solid #e5e7eb;border-radius:12px">' +
     '<h2 style="margin:0 0 8px;color:#1f2937">记忆宫殿 · 安全验证</h2>' +
     '<p style="color:#6b7280;font-size:14px">你的验证码（10 分钟内有效）：</p>' +
     '<p style="font-size:32px;letter-spacing:6px;font-weight:700;color:#5b8cff;margin:12px 0">' + code + '</p>' +
     '<p style="color:#9ca3af;font-size:12px">若非本人操作请忽略此邮件，并立即检查你的钱包登录状态。</p>' +
     '</div>'
+
+  const boundary = '----=_Part_' + randStr(16)
+  const textBody = '你的验证码是：' + code + '（10 分钟内有效）。若非本人操作请忽略此邮件。'
+
+  const mimeHeaders =
+    'From: ' + from + '\r\n' +
+    'To: ' + to + '\r\n' +
+    'Subject: ' + subject + '\r\n' +
+    'MIME-Version: 1.0\r\n' +
+    'Content-Type: multipart/alternative; boundary="' + boundary + '"\r\n' +
+    'Date: ' + new Date().toUTCString() + '\r\n' +
+    'Message-Id: <' + randStr(20) + '@gyuanpalace.xyz>\r\n' +
+    '\r\n'
+
+  const mimeBody =
+    '--' + boundary + '\r\n' +
+    'Content-Type: text/plain; charset=UTF-8\r\n' +
+    'Content-Transfer-Encoding: 8bit\r\n' +
+    '\r\n' +
+    textBody + '\r\n' +
+    '--' + boundary + '\r\n' +
+    'Content-Type: text/html; charset=UTF-8\r\n' +
+    'Content-Transfer-Encoding: 8bit\r\n' +
+    '\r\n' +
+    htmlBody + '\r\n' +
+    '--' + boundary + '--\r\n'
+
+  const emailData = mimeHeaders + mimeBody
+
   try {
-    const r = await fetch('https://api.resend.com/emails', {
-      method: 'POST',
-      headers: { 'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ from, to: [to], subject, html: body })
-    })
-    if (!r.ok) { const t = await r.text(); console.error('resend send:', r.status, t.slice(0, 300)); return false }
-    return true
-  } catch (e) { console.error('resend send:', e.message); return false }
+    const logs = []
+    const enc = new TextEncoder()
+    // 端口 465 → 隐式 TLS；端口 587 → STARTTLS（先明文后升级）
+    const useStartTls = port === 587
+    logs.push('socket connecting, port=' + port + ', mode=' + (useStartTls ? 'STARTTLS' : 'implicit TLS'))
+    const socket0 = connect({ hostname: host, port }, { secureTransport: useStartTls ? 'starttls' : 'on' })
+    logs.push('socket created')
+    let socket = socket0
+    let writer = socket.writable.getWriter()
+    let reader = socket.readable.getReader()
+
+    let sendCmd = async (cmd) => {
+      logs.push('>> ' + cmd)
+      await writer.write(enc.encode(cmd + '\r\n'))
+      const r = await smtpRead(reader)
+      logs.push('<< ' + r.substring(0, 80))
+      return r
+    }
+
+    // 读取 greeting
+    let resp = await smtpRead(reader, 50, 15000)
+    logs.push('<<greeting ' + resp.substring(0, 80))
+    if (!resp.startsWith('220')) { await socket.close(); return { ok: false, logs } }
+
+    // EHLO
+    resp = await sendCmd('EHLO gyuanpalace.xyz')
+    if (!resp.includes('250')) { await socket.close(); return { ok: false, logs } }
+
+    // STARTTLS 升级（仅 587 模式）
+    if (useStartTls) {
+      resp = await sendCmd('STARTTLS')
+      logs.push('STARTTLS resp: ' + resp.substring(0, 60))
+      if (!resp.startsWith('220')) { await socket.close(); return { ok: false, logs } }
+
+      // 释放 reader/writer 锁后才能调用 startTls()
+      await reader.cancel()
+      reader.releaseLock()
+      writer.releaseLock()
+      let tlsSocket
+      try {
+        tlsSocket = socket.startTls()
+      } catch (e) {
+        logs.push('startTls error: ' + e.message)
+        await socket.close()
+        return { ok: false, logs }
+      }
+      logs.push('upgraded to TLS')
+      writer = tlsSocket.writable.getWriter()
+      reader = tlsSocket.readable.getReader()
+      socket = tlsSocket
+
+      // TLS 升级后需重新 EHLO
+      resp = await sendCmd('EHLO gyuanpalace.xyz')
+      if (!resp.includes('250')) { await socket.close(); return { ok: false, logs } }
+    }
+
+    // AUTH LOGIN
+    resp = await sendCmd('AUTH LOGIN')
+    if (!resp.startsWith('334')) { await socket.close(); return { ok: false, logs } }
+
+    // 用户名（Base64）
+    resp = await sendCmd(btoa(user))
+    if (!resp.startsWith('334')) { await socket.close(); return { ok: false, logs } }
+
+    // 密码（Base64）
+    resp = await sendCmd(btoa(pass))
+    if (!resp.startsWith('235')) { await socket.close(); return { ok: false, logs } }
+
+    // MAIL FROM
+    resp = await sendCmd('MAIL FROM:<' + from + '>')
+    if (!resp.startsWith('250')) { await socket.close(); return { ok: false, logs } }
+
+    // RCPT TO
+    resp = await sendCmd('RCPT TO:<' + to + '>')
+    if (!resp.startsWith('250')) { await socket.close(); return { ok: false, logs } }
+
+    // DATA
+    resp = await sendCmd('DATA')
+    if (!resp.startsWith('354')) { await socket.close(); return { ok: false, logs } }
+
+    // 发送邮件内容
+    await writer.write(enc.encode(emailData + '\r\n.\r\n'))
+    resp = await smtpRead(reader)
+    logs.push('<<data ' + resp.substring(0, 80))
+    if (!resp.startsWith('250')) { await socket.close(); return { ok: false, logs } }
+
+    // QUIT
+    await sendCmd('QUIT')
+    await socket.close()
+
+    return { ok: true, logs }
+  } catch (e) {
+    return { ok: false, error: e.message, stack: e.stack?.substring(0, 200) }
+  }
 }
 
 // 生成验证码并落库（同 wallet+action 复用，旧码作废）；返回 { sent, expires_in, masked_email }
@@ -3349,13 +3496,23 @@ async function createEmailVerifyCode(wallet, action, email) {
   const code = String(Math.floor(100000 + Math.random() * 900000))
   const codeHash = await hmacSign(wallet + ':' + action + ':' + code, wallet + ':email_code')
   const now = Date.now()
+  const codeId = 'EVC_' + randStr(6)
+
   // 同钱包同动作的旧码全部作废，防止多码并发
   await dbRun(`DELETE FROM email_verify_codes WHERE wallet = ? AND action = ?`, [wallet, action])
   await dbRun(`INSERT INTO email_verify_codes (id, wallet, action, email, code_hash, expires_at, used, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    ['EVC_' + randStr(6), wallet, action, email, codeHash, now + EMAIL_CODE_TTL, 0, now])
-  const sent = await sendVerifyEmail(email, code, action)
+    [codeId, wallet, action, email, codeHash, now + EMAIL_CODE_TTL, 0, now])
+
+  const result = await sendVerifyEmail(email, code, action)
+  const sent = result.ok
+
+  // 发送失败时清理验证码，避免数据库中残留无效验证码
+  if (!sent) {
+    await dbRun(`DELETE FROM email_verify_codes WHERE id = ?`, [codeId])
+  }
+
   const masked = email.replace(/^(.).*@/, (m) => m[0] + '***@')
-  return { sent, expires_in: EMAIL_CODE_TTL, masked_email: masked }
+  return { sent, expires_in: EMAIL_CODE_TTL, masked_email: masked, _debug: result.logs || result.error || '' }
 }
 
 // 校验验证码：正确则消费（一次性）
@@ -3525,8 +3682,8 @@ async function accountVerifySend(body, url) {
   }
   const r = await createEmailVerifyCode(wallet, action, target)
   return json({ sent: r.sent, action, expires_in: r.expires_in, masked_email: r.masked_email,
-    message: r.sent ? '验证码已发送至邮箱，10 分钟内有效' : '邮件服务未配置（RESEND_API_KEY），验证码已生成但无法发送',
-    network_time: Date.now() })
+    message: r.sent ? '验证码已发送至邮箱，10 分钟内有效' : '邮件服务未配置（SMTP），验证码已生成但无法发送',
+    _debug: r._debug, network_time: Date.now() })
 }
 
 async function walletInfo(url) {
