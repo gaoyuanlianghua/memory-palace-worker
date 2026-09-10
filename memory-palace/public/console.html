@@ -1161,7 +1161,7 @@ function switchLoginTab(i) {
 async function doLogin() {
   if (loginTab === 0) {
     // 密码通道：POST /api/account/login
-    const wallet = q('lgWallet').trim(), password = q('lgPass').value;
+    const wallet = q('lgWallet').trim(), password = q('lgPass');
     if (!wallet || !password) return toast('请填写钱包和密码','err');
     try {
       const d = await api('POST','/api/account/login',{wallet, password, device_id: deviceId(), device_name: deviceName()});
@@ -1244,7 +1244,7 @@ function openResetPwd() {
 }
 async function doResetPwd() {
   if (!window.__rcSig || !recoverChallenge) return toast('请重新发起找回流程','err');
-  const p1 = q('rsPwd').value, p2 = q('rsPwd2').value;
+  const p1 = q('rsPwd'), p2 = q('rsPwd2');
   if (p1.length < 12) return toast('密码至少 12 位','err');
   if (p1 !== p2) return toast('两次密码不一致','err');
   try {
@@ -1271,7 +1271,7 @@ async function sendSetPwdCode() {
     const d = await api('POST','/api/account/verify/send',{wallet: store.wallet, action: 'password'});
     __pwdCodeSent = Date.now();
     $('spCodeMsg').innerHTML = d.sent ? '✅ 验证码已发送至 '+esc(d.masked_email)+'（10 分钟内有效）'
-      : '⚠️ 邮件服务未配置（RESEND_API_KEY），无法发送验证码';
+      : '⚠️ 邮件服务未配置（SMTP），无法发送验证码';
     if (d.sent) {
       btn.disabled = true;
       let left = 60; const t = setInterval(() => { btn.textContent = '重新发送('+(--left)+'s)'; if (left<=0){ clearInterval(t); btn.disabled=false; btn.textContent='发送验证码'; } }, 1000);
@@ -1280,7 +1280,7 @@ async function sendSetPwdCode() {
   } catch(e) { toast(e.message,'err'); }
 }
 async function doSetPwd() {
-  const p1 = q('spPwd').value, p2 = q('spPwd2').value, code = q('spCode').value.trim();
+  const p1 = q('spPwd'), p2 = q('spPwd2'), code = q('spCode').trim();
   if (p1.length < 12) return toast('密码至少 12 位','err');
   if (p1 !== p2) return toast('两次密码不一致','err');
   if (!code) return toast('请先获取并填写邮箱验证码','err');
@@ -1299,25 +1299,37 @@ function openBindEmail() {
     '<button class="btn btn-ghost" onclick="closeModal()">取消</button><button class="btn" onclick="doBindEmail()">保存</button>');
 }
 async function sendBindEmailCode() {
-  const email = q('beEmail').value.trim();
+  console.log('[sendBindEmailCode] called, store.wallet:', store.wallet);
+  if (!store.wallet) return toast('请先登录','err');
+  const email = q('beEmail').trim();
+  console.log('[sendBindEmailCode] email:', email);
   if (!email) return toast('请先填写新邮箱','err');
   const btn = $('beSendBtn');
   if (btn.disabled) return;
+  btn.disabled = true;
   try {
+    console.log('[sendBindEmailCode] calling API...');
     const d = await api('POST','/api/account/verify/send',{wallet: store.wallet, action: 'email', email});
+    console.log('[sendBindEmailCode] API response:', d);
     __emailCodeSent = Date.now();
     $('beCodeMsg').innerHTML = d.sent ? '✅ 验证码已发送至 '+esc(d.masked_email)+'（10 分钟内有效）'
-      : '⚠️ 邮件服务未配置（RESEND_API_KEY），无法发送验证码';
+      : '⚠️ 邮件服务未配置（SMTP），无法发送验证码';
     if (d.sent) {
-      btn.disabled = true;
       let left = 60; const t = setInterval(() => { btn.textContent = '重新发送('+(--left)+'s)'; if (left<=0){ clearInterval(t); btn.disabled=false; btn.textContent='发送验证码'; } }, 1000);
+    } else {
+      btn.disabled = false;
     }
     if (!d.sent) toast(d.message || '发送失败','warn');
-  } catch(e) { toast(e.message,'err'); }
+  } catch(e) {
+    console.error('[sendBindEmailCode] error:', e);
+    btn.disabled = false;
+    btn.textContent = '发送验证码';
+    toast(e.message,'err');
+  }
 }
 async function doBindEmail() {
-  const email = q('beEmail').value.trim();
-  const code = q('beCode').value.trim();
+  const email = q('beEmail').trim();
+  const code = q('beCode').trim();
   if (!email) return toast('请填写新邮箱','err');
   if (!code) return toast('请先获取并填写新邮箱验证码','err');
   try {
